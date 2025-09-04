@@ -1,0 +1,22 @@
+{
+  "USDT": {
+    "feedAddress": "0x1f6C07F2A467E3d6BbD5e34845bF56a5D5dbA96c", 
+    "description": "Chainlink Price Feed for USDT (Tether) on Polygon"
+  },
+  "DAI": {
+    "feedAddress": "0xA2cF9D1D24D67A2aF699F587D9f9C4E1C9bcA17F",
+    "description": "Chainlink Price Feed for DAI (Decentralized Dollar) on Polygon"
+  },
+  "MATIC": {
+    "feedAddress": "0x8fF1DBc2bFF7FB7384c8dD3D5C86d3E7c1A8DBA1",
+    "description": "Chainlink Price Feed for MATIC on Polygon"
+  },
+  "USDC": {
+    "feedAddress": "0x1e4F9cB3b6f9FCB4Af5d1A28E3221A6B5bF949B2",
+    "description": "Chainlink Price Feed for USDC on Polygon"
+  },
+  "WETH": {
+    "feedAddress": "0x6491d04061F75b66c52EccDA312EEe2b6e87058e",
+    "description": "Chainlink Price Feed for WETH (Wrapped Ether) on Polygon"
+  }
+}
