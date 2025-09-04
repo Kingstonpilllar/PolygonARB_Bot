@@ -1,0 +1,27 @@
+[
+  {
+    "symbol": "USDT",
+    "coingeckoPriceUSD": 1,
+    "krakenPriceUSD": 1.0012
+  },
+  {
+    "symbol": "DAI",
+    "coingeckoPriceUSD": 1,
+    "krakenPriceUSD": 1.002
+  },
+  {
+    "symbol": "MATIC",
+    "coingeckoPriceUSD": 0.75,
+    "krakenPriceUSD": 0.751
+  },
+  {
+    "symbol": "USDC",
+    "coingeckoPriceUSD": 1,
+    "krakenPriceUSD": 1
+  },
+  {
+    "symbol": "WETH",
+    "coingeckoPriceUSD": 1880,
+    "krakenPriceUSD": 1882
+  }
+]
