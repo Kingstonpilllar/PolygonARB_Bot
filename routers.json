@@ -1,0 +1,32 @@
+[
+  {
+    "symbol": "USDT",
+    "bestRouter": "uniswap",
+    "price": 1,
+    "pairId": "0x1234567890abcdef"
+  },
+  {
+    "symbol": "DAI",
+    "bestRouter": "sushiswap",
+    "price": 1.002,
+    "pairId": "0xabcdef1234567890"
+  },
+  {
+    "symbol": "MATIC",
+    "bestRouter": "quickswap",
+    "price": 0.75,
+    "pairId": "0xabcdefabcdefabcdef"
+  },
+  {
+    "symbol": "USDC",
+    "bestRouter": "uniswap",
+    "price": 1.0001,
+    "pairId": "0x1234abcd5678efgh"
+  },
+  {
+    "symbol": "WETH",
+    "bestRouter": "sushiswap",
+    "price": 1800,
+    "pairId": "0xabcdef1234567890"
+  }
+]
