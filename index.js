@@ -1,4 +1,13 @@
 require("dotenv").config();
+const config = JSON.parse(
+  Buffer.from(process.env.APP_CONFIG_B64, 'base64').toString('utf8')
+);
+
+// Example usage:
+console.log(config.MEV_FILE);                  // "../mev_queue.json"
+console.log(config.POOLFETCHER_MIN_PROFIT_USD); // "40"
+console.log(config.AAVE_LOAN);                 // "true"
+
 
 function startModule(name, modulePath) {
   const start = () => {
@@ -31,3 +40,4 @@ startModule("Direct Pool listener", "./checkdirectpool.js");
 startModule("Tri Pool listener", "./check_tri_pool.js");
 
 console.log("🎯 All services are running. Monitoring trade alerts and supplying pool data...");
+
