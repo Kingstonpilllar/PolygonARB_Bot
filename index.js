@@ -25,7 +25,7 @@ function startModule(name, modulePath) {
 }
 
 // WebSocket provider first
-startModule("Data Provider (WebSocket)", "./dataProvider.js");
+startModule("Data Provider (WebSocket)", "./dataprovider.js");
 
 // WebSocket data suppliers
 startModule("Pool Fetcher", "./poolfetcher.js");
@@ -40,3 +40,4 @@ startModule("Direct Pool listener", "./checkdirectpool.js");
 startModule("Tri Pool listener", "./check_tri_pool.js");
 
 console.log("🎯 All services are running. Monitoring trade alerts and supplying pool data...");
+
