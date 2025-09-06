@@ -29,7 +29,7 @@ runUpdateConfig();
 // 1) Imports that depend on env/config
 // ===========================================================
 const protection = require('./protectionutilities.js');
-const ParallelSubmit = require('./parallelsubmit.js');
+
 
 let factories = null;
 try { factories = require('./factories.js'); } catch (_) {}
@@ -445,3 +445,4 @@ async function sendWithRpcFallback(txReq, nonce) {
 console.log('[BOT] hybridsimulationbot running (15 logics: protections + alerts + gas skip).'); // Flashbots removed
 listenForBlocks();
 setInterval(scanAndExecute, BOT_INTERVAL_MS);
+
