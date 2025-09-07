@@ -1,6 +1,11 @@
-require("dotenv").config();
-const axios = require("axios");
-const EventEmitter = require("events");
+// telegramalert.js â€” ESM version (compatible with ethers v6 project)
+// Make sure package.json has: { "type": "module" }
+
+import dotenv from "dotenv";
+import axios from "axios";
+import { EventEmitter } from "events";
+
+dotenv.config();
 
 // ----- helpers -----
 function pickEnvByChain(baseKey, chainId) {
@@ -75,7 +80,7 @@ async function sendTelegramAlert(message, opts = {}) {
 
       try {
         await axios.post(url, payload, { timeout: 15000 });
-        console.log(`[TELEGRAM] Sent to ${chat_id}${threadId ? `#${threadId}` : ""}: ${part.slice(0, 80)}${part.length > 80 ? "…" : ""}`);
+        console.log(`[TELEGRAM] Sent to ${chat_id}${threadId ? `#${threadId}` : ""}: ${part.slice(0, 80)}${part.length > 80 ? "â€¦" : ""}`);
       } catch (err) {
         const msg = err?.response?.data?.description || err.message;
         console.error(`[TELEGRAM] Failed for ${chat_id}: ${msg}`);
@@ -101,9 +106,8 @@ async function sendAndEmit(message, opts = {}) {
     const tradeId = match ? match[1] : null;
 
     if (tradeId) {
-      // 🔥 Broadcast to both listeners (direct_pool + tri_pool)
       alertEmitter.emit("alert", { type, tradeId });
-      console.log(`📩 Local Alert -> type: ${type}, tradeId: ${tradeId}`);
+      console.log(`ðŸ“¨ Local Alert -> type: ${type}, tradeId: ${tradeId}`);
     }
   }
 }
@@ -114,8 +118,9 @@ function listenTelegramAlerts(callback) {
 }
 
 // ----- exports -----
-module.exports = Object.assign(sendAndEmit, {
-  sendTelegramAlert: sendAndEmit,
-  send: sendAndEmit,
-  listenTelegramAlerts,
-});
+export {
+  sendAndEmit as sendTelegramAlert,
+  sendAndEmit as send,
+  listenTelegramAlerts
+};
+export default sendAndEmit;
