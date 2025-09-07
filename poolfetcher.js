@@ -1,49 +1,91 @@
-// Dependencies: npm install ethers axios fs
+// ESM + Ethers v6 version
+// Dependencies: npm install ethers axios
+// (fs, path, child_process are built-in)
 
-const { ethers } = require("ethers");
-const axios = require("axios");
-const fs = require("fs");
-const { spawnSync } = require("child_process");
+import 'dotenv/config';
+import { ethers } from 'ethers';
+import axios from 'axios';
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
-const dexConfig = require("./dexconfig.json");
-const { FACTORIES } = require("./factories.js");
-const factoryABIs = require("./factory_ABI.js"); // assumed export of ABIs
+import dexConfig from './dexconfig.json' assert { type: 'json' };
+import { FACTORIES } from './factories.js';
+import factoryABIs from './factory_ABI.js'; // assumed export of ABIs
 
 // === CONFIG (Polygon-only) ===
 const WSS_URLS = process.env.WSS_URLS
-  ? process.env.WSS_URLS.split(",").map(s => s.trim())
+  ? process.env.WSS_URLS.split(',').map(s => s.trim())
   : [];
 
 if (WSS_URLS.length === 0) {
-  throw new Error("❌ No WSS_URLS found in .env (example: WSS_URLS=wss://alchemy...,wss://quiknode...)");
+  throw new Error('❌ No WSS_URLS found in .env (example: WSS_URLS=wss://alchemy...,wss://quiknode...)');
 }
 
 let provider;
 let currentIndex = 0;
 
+/** -----------------------------------------------------------------
+ *  v6-safe helpers for WebSocket events (no logic changes)
+ *  - Prefer public provider events when available
+ *  - Still support private _websocket if present (best-effort)
+ * ----------------------------------------------------------------*/
+function wsAddListener(ws, event, handler) {
+  if (!ws) return;
+  if (typeof ws.addEventListener === 'function') ws.addEventListener(event, handler);
+  else if (typeof ws.on === 'function') ws.on(event, handler);
+  else ws[`on${event}`] = handler;
+}
+
+function wsRemoveListener(ws, event, handler) {
+  if (!ws) return;
+  if (typeof ws.removeEventListener === 'function') ws.removeEventListener(event, handler);
+  else if (typeof ws.off === 'function') ws.off(event, handler);
+  else if (ws[`on${event}`] === handler) ws[`on${event}`] = null;
+}
+
 /**
  * Connect to WebSocket provider with failover support
+ * (Logic preserved; uses v6 public 'error' + optional private handle if present)
  */
 async function connectProvider() {
   const url = WSS_URLS[currentIndex];
   console.log(`🔌 Connecting WebSocket provider: ${url}`);
+
+  // v6-compatible constructor
   provider = new ethers.WebSocketProvider(url);
 
-  // Connection success
-  provider._websocket.on("open", () => {
-    console.log(`✅ WebSocket connected: ${url}`);
-  });
-
-  // Error handling
-  provider._websocket.on("error", (err) => {
-    console.error(`❌ WebSocket error on ${url}:`, err.message);
+  // Public error surface (v6)
+  const onProvError = (err) => {
+    console.error(`❌ WebSocket provider error on ${url}:`, err?.message || err);
     failover();
-  });
+  };
+  provider.on('error', onProvError);
 
-  provider._websocket.on("close", () => {
-    console.warn(`⚠️ WebSocket closed: ${url}`);
-    failover();
-  });
+  // If the underlying ws is exposed, wire open/error/close like your original
+  const ws = provider._websocket || provider._ws || provider._socket || null;
+
+  if (ws) {
+    const onOpen = () => console.log(`✅ WebSocket connected: ${url}`);
+    const onErr  = (err) => {
+      console.error(`❌ WebSocket error on ${url}:`, err?.message || err);
+      failover();
+    };
+    const onClose = () => {
+      console.warn(`⚠️ WebSocket closed: ${url}`);
+      failover();
+    };
+
+    wsAddListener(ws, 'open', onOpen);
+    wsAddListener(ws, 'error', onErr);
+    wsAddListener(ws, 'close', onClose);
+
+    // Keep references so GC won’t drop them (optional)
+    provider.__wsHandlers = { onOpen, onErr, onClose, onProvError, wsRef: ws };
+  } else {
+    // Fallback: we can’t get the raw socket; rely on provider events + a small heartbeat
+    provider.__wsHandlers = { onProvError, wsRef: null };
+  }
 
   return provider;
 }
@@ -52,41 +94,74 @@ async function connectProvider() {
  * Failover logic for WebSocket provider
  */
 function failover() {
-  console.log("♻️ Switching provider...");
+  try {
+    // best-effort cleanup (v6 has destroy())
+    provider?.off?.('error', provider?.__wsHandlers?.onProvError);
+    if (provider?.destroy) { try { provider.destroy(); } catch (_) {} }
+    const ws = provider?.__wsHandlers?.wsRef;
+    if (ws && provider?.__wsHandlers) {
+      wsRemoveListener(ws, 'open',  provider.__wsHandlers.onOpen);
+      wsRemoveListener(ws, 'error', provider.__wsHandlers.onErr);
+      wsRemoveListener(ws, 'close', provider.__wsHandlers.onClose);
+    }
+  } catch (_) {}
+
+  console.log('♻️ Switching provider...');
   currentIndex = (currentIndex + 1) % WSS_URLS.length; // Rotate to next WSS URL
-  connectProvider().then(startListeners);
+  connectProvider().then(startListeners).catch((e) => {
+    console.error('Failover connect error:', e?.message || e);
+    // try next
+    setTimeout(failover, 1000);
+  });
 }
 
 /**
  * --- WebSocket readiness helpers (no logic changes elsewhere) ---
+ * v6-safe: prefer provider.getBlockNumber as a heartbeat when private socket is unavailable
  */
 function waitForOpen(wsProvider, timeoutMs = 12000) {
   return new Promise((resolve, reject) => {
-    const ws = wsProvider?._websocket;
-    if (ws && ws.readyState === 1) return resolve();
+    const ws = wsProvider?._websocket || wsProvider?._ws || wsProvider?._socket || null;
 
-    const onOpen = () => { cleanup(); resolve(); };
-    const onError = (err) => { cleanup(); reject(err instanceof Error ? err : new Error(String(err))); };
-    const timer = setTimeout(() => { cleanup(); reject(new Error("WebSocket open timeout")); }, timeoutMs);
-
-    function cleanup() {
-      clearTimeout(timer);
-      if (!ws) return;
-      ws.removeEventListener?.("open", onOpen);
-      ws.removeEventListener?.("error", onError);
-      if (ws.onopen === onOpen) ws.onopen = null;
-      if (ws.onerror === onError) ws.onerror = null;
+    // If socket is already open
+    if (ws && typeof ws.readyState === 'number' && ws.readyState === 1) {
+      return resolve();
     }
+
+    let done = false;
+    const finish = (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      clearInterval(pollTimer);
+      if (err) reject(err); else resolve();
+    };
+
+    // v6-safe active poll (works even when private ws is not exposed)
+    const pollInterval = 750;
+    const pollTimer = setInterval(async () => {
+      try {
+        await wsProvider.getBlockNumber();
+        finish();
+      } catch (_) {}
+    }, pollInterval);
+
+    // Private handle path (keep original behavior if present)
+    const onOpen = () => finish();
+    const onError = (err) => finish(err instanceof Error ? err : new Error(String(err)));
 
     if (ws) {
-      ws.addEventListener?.("open", onOpen);
-      ws.addEventListener?.("error", onError);
-      ws.onopen = onOpen;
-      ws.onerror = onError;
+      wsAddListener(ws, 'open', onOpen);
+      wsAddListener(ws, 'error', onError);
     } else {
-      wsProvider.on("error", onError);
-      wsProvider.once("block", () => { cleanup(); resolve(); });
+      // As a fallback, resolve on first block (same net effect)
+      wsProvider.once?.('block', () => finish());
+      wsProvider.on?.('error', onError);
     }
+
+    const timer = setTimeout(() => {
+      finish(new Error('WebSocket open timeout'));
+    }, timeoutMs);
   });
 }
 
@@ -96,9 +171,9 @@ async function ready() {
 }
 
 function startListeners() {
-  // Example: listen to new blocks
-  provider.on("block", (blockNumber) => {
-    console.log("⛓️ New block:", blockNumber);
+  // Example: listen to new blocks (unchanged)
+  provider.on('block', (blockNumber) => {
+    console.log('⛓️ New block:', blockNumber);
     // ⚡ Add your pool fetch logic here
   });
 }
@@ -106,23 +181,23 @@ function startListeners() {
 // Start WebSocket connection and listeners
 async function start() {
   await connectProvider();
-  await waitForOpen(provider);  // ensure WS is actually open
+  await waitForOpen(provider);  // ensure WS is actually open (unchanged)
   startListeners();
 }
 start();
 
 // === PROFIT ESTIMATION HELPERS ===
 const DEX_FEE_BPS = {
-  "QuickSwap": 30,
-  "QuickSwap V2": 30,
-  "QuickSwap V3": 5,
-  "SushiSwap": 30,
-  "SushiSwap V2": 30,
-  "SushiSwap V3": 5,
-  "Uniswap": 30,
-  "Uniswap V3": 5,
-  "DODO": 10,
-  "KyberSwap Elastic": 10
+  'QuickSwap': 30,
+  'QuickSwap V2': 30,
+  'QuickSwap V3': 5,
+  'SushiSwap': 30,
+  'SushiSwap V2': 30,
+  'SushiSwap V3': 5,
+  'Uniswap': 30,
+  'Uniswap V3': 5,
+  'DODO': 10,
+  'KyberSwap Elastic': 10
 };
 
 const DEFAULT_FEE_BPS = 30;
@@ -162,7 +237,7 @@ function edgeToProfitUSD(edgeFrac, notionalUSD = NOTIONAL_USD) {
 // === HELPERS ===
 async function getTokenPrices(tokenAddresses) {
   if (!tokenAddresses.length) return {};
-  const ids = tokenAddresses.map(addr => addr.toLowerCase()).join(",");
+  const ids = tokenAddresses.map(addr => addr.toLowerCase()).join(',');
   const url = `https://api.coingecko.com/api/v3/simple/token_price/polygon-pos?contract_addresses=${ids}&vs_currencies=usd`;
   const resp = await axios.get(url);
   return resp.data;
@@ -178,7 +253,7 @@ async function fetchPairs(factoryAddr, abi) {
       const pairAddr = await contract.allPairs(i);
       pairs.push(pairAddr);
     } catch (err) {
-      console.error("Error fetching pair index", i, err.message);
+      console.error('Error fetching pair index', i, err.message);
     }
   }
   return pairs;
@@ -186,9 +261,9 @@ async function fetchPairs(factoryAddr, abi) {
 
 async function getPairInfo(pairAddr) {
   const pairABI = [
-    "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
-    "function token0() view returns (address)",
-    "function token1() view returns (address)"
+    'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+    'function token0() view returns (address)',
+    'function token1() view returns (address)'
   ];
   const pairContract = new ethers.Contract(pairAddr, pairABI, provider);
   const [t0, t1, reserves] = await Promise.all([
@@ -219,7 +294,7 @@ function calcPrice(reserve0, reserve1) {
  *  --------------------------------------------------------------------- */
 
 // keccak256("Swap(address,uint256,uint256,uint256,uint256,address)")
-const SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613dacf8b9baed548f383ad7bc38c5f";
+const SWAP_TOPIC = '0xd78ad95fa46c994b6551d0da85fc275fe613dacf8b9baed548f383ad7bc38c5f';
 
 // Stable key for pair regardless of token order
 function pairKey(a, b) {
@@ -232,7 +307,7 @@ function appendJson(filename, record) {
   try {
     let arr = [];
     if (fs.existsSync(filename)) {
-      const prev = fs.readFileSync(filename, "utf8");
+      const prev = fs.readFileSync(filename, 'utf8');
       if (prev) arr = JSON.parse(prev);
     }
     arr.push(record);
@@ -245,7 +320,7 @@ function appendJson(filename, record) {
 // Start watching Swap events for provided pools
 function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToken, edgeThreshold = 0) {
   if (!pairAddrsLower.length) {
-    console.log("No pools to watch for swaps.");
+    console.log('No pools to watch for swaps.');
     return;
   }
 
@@ -289,8 +364,8 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
             );
 
             // Persist event record
-            appendJson("swap_event_arbs.json", {
-              type: "direct",
+            appendJson('swap_event_arbs.json', {
+              type: 'direct',
               timestamp: Date.now(),
               blockNumber: Number(log.blockNumber),
               txHash: log.transactionHash,
@@ -307,7 +382,7 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
             });
 
             // ALSO update direct_pool.json with this opportunity
-            appendJson("direct_pool.json", {
+            appendJson('direct_pool.json', {
               token0: pool.token0,
               token1: pool.token1,
               dexA: pool.dex,
@@ -318,7 +393,7 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
               poolAddrB: other.pairAddr,
               edge,
               estProfitUSD,
-              source: "swap_event"
+              source: 'swap_event'
             });
           }
         }
@@ -354,14 +429,14 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
             const estProfitUSD = edgeToProfitUSD(edgeTri);
             if (estProfitUSD >= MIN_PROFIT_USD) {
               console.log(
-                `🔺 Swap-led TRI ${tokenA}->${tokenB}->${tokenC}->${tokenA} | dexs=${dexs.join(" > ")} | ` +
+                `🔺 Swap-led TRI ${tokenA}->${tokenB}->${tokenC}->${tokenA} | dexs=${dexs.join(' > ')} | ` +
                 `edge=${(edgeTri*100).toFixed(3)}% est=$${estProfitUSD.toFixed(2)} | ` +
                 `pools=[${pool.pairAddr}, ${pool2.pairAddr}, ${pool3.pairAddr}] | tx=${log.transactionHash}`
               );
 
               // Persist event record
-              appendJson("swap_event_arbs.json", {
-                type: "triangular",
+              appendJson('swap_event_arbs.json', {
+                type: 'triangular',
                 timestamp: Date.now(),
                 blockNumber: Number(log.blockNumber),
                 txHash: log.transactionHash,
@@ -374,21 +449,21 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
               });
 
               // ALSO update tri_pool.json with this triangle opportunity
-              appendJson("tri_pool.json", {
+              appendJson('tri_pool.json', {
                 route: [tokenA, tokenB, tokenC, tokenA],
                 pools: [pool.pairAddr, pool2.pairAddr, pool3.pairAddr],
                 dexs,
                 cycleRate,
                 edge: edgeTri,
                 estProfitUSD,
-                source: "swap_event"
+                source: 'swap_event'
               });
             }
           }
         }
       }
     } catch (e) {
-      console.error("Swap handler error:", e?.message || e);
+      console.error('Swap handler error:', e?.message || e);
     }
   });
 }
@@ -402,7 +477,7 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
   // Fetch pools from each DEX
   for (const dex of dexConfig.polygon) {
     const dexName = dex.name;
-    if (!dex.factory || dex.factory === "0x..." || !FACTORIES[dexName]) {
+    if (!dex.factory || dex.factory === '0x...' || !FACTORIES[dexName]) {
       console.log(`Skipping ${dexName} — no valid factory`);
       continue;
     }
@@ -553,8 +628,8 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
   triArbs.sort((a, b) => (b.estProfitUSD - a.estProfitUSD));
 
   // Save results to JSON files
-  fs.writeFileSync("direct_pool.json", JSON.stringify(directArbs, null, 2));
-  fs.writeFileSync("tri_pool.json", JSON.stringify(triArbs, null, 2));
+  fs.writeFileSync('direct_pool.json', JSON.stringify(directArbs, null, 2));
+  fs.writeFileSync('tri_pool.json', JSON.stringify(triArbs, null, 2));
 
   console.log(`Saved ${directArbs.length} direct and ${triArbs.length} triangular arbs (>= $${MIN_PROFIT_USD})`);
 })();
