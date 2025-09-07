@@ -1,7 +1,7 @@
 import fs from "fs";
 import axios from "axios";
 
-// List of tokens to track (expand up to 200)
+// List of tokens to track (expand up to 220)
 const tokens = [
   { symbol: "USDT", coingeckoId: "tether",           krakenPair: "USDTZUSD" },
   { symbol: "DAI",  coingeckoId: "dai",              krakenPair: "DAIUSD"   },
@@ -136,4 +136,5 @@ updateTokenlist();
 
 // Auto-update every 5 minutes
 setInterval(updateTokenlist, 5 * 60 * 1000);
+
 
