@@ -13,7 +13,7 @@ const tokens = [
 ];
 
 const TOKENLIST_FILE = "./tokenlist.json";
-const MAX_TOKENS = 200;
+const MAX_TOKENS = 220;
 const MAX_SPREAD_PERCENT = 1; // Max allowed spread between bid & ask
 const MIN_VOLUME = 1000;      // USD (optional)
 
@@ -136,3 +136,4 @@ updateTokenlist();
 
 // Auto-update every 5 minutes
 setInterval(updateTokenlist, 5 * 60 * 1000);
+
