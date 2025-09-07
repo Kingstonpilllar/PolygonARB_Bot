@@ -1,5 +1,5 @@
-const fs = require('fs');
-const axios = require('axios');
+import fs from "fs";
+import axios from "axios";
 
 // List of 10 Polygon DEXes (GraphQL endpoints)
 const routers = {
@@ -112,3 +112,4 @@ updateRouters();
 
 // Optional: Update every 5 minutes
 setInterval(updateRouters, 5 * 60 * 1000); // Update every 5 minutes
+
