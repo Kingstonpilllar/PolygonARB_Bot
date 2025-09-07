@@ -1,11 +1,9 @@
-// protectionutilities.js
+// protectionutilities.js  — Ethers v6 (ESM) with your 11 protections unchanged
+// To use: ensure "type": "module" in package.json
 
-// 11 safety/profit protections + WEBSOCKET FALLBACK + FLASH TOKEN FALLBACK + CHAINLINK USD CHECK
-
-require("dotenv").config();
-
-const fs = require("fs");
-const { ethers } = require("ethers");
+import 'dotenv/config';
+import fs from 'fs';
+import { ethers } from 'ethers';
 
 // ---------- ENV CONFIG ----------
 const PROFIT_THRESHOLD_BPS = Number(process.env.PROFIT_THRESHOLD_BPS || 100);
@@ -13,22 +11,22 @@ const PROFIT_THRESHOLD_USD = Number(process.env.PROFIT_THRESHOLD_USD || 0);
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 3000);
 
 const MAX_SLIPPAGE_BPS = Number(process.env.MAX_SLIPPAGE_BPS || 100);
-const HIGH_GAS_GWEI = ethers.parseUnits(process.env.HIGH_GAS_GWEI || "300", "gwei");
-const GAS_LIMIT_MAX = BigInt(process.env.GAS_LIMIT_MAX || "2000000");
+const HIGH_GAS_GWEI = ethers.parseUnits(process.env.HIGH_GAS_GWEI || '300', 'gwei');
+const GAS_LIMIT_MAX = BigInt(process.env.GAS_LIMIT_MAX || '2000000');
 const GAS_PRICE_TIMEOUT_MS = Number(process.env.GAS_PRICE_TIMEOUT_MS || 1200);
 const ESTIMATE_GAS_TIMEOUT_MS = Number(process.env.ESTIMATE_GAS_TIMEOUT_MS || 1800);
 
-const MEV_FILE = process.env.MEV_FILE || "./mev_queue.json";
+const MEV_FILE = process.env.MEV_FILE || './mev_queue.json';
 const MEV_LOOKBACK_MS = Number(process.env.MEV_LOOKBACK_MS || 10_000);
 
 // ---------- WebSocket Providers ----------
-const WS_URLS = (process.env.WS_URLS || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
+const WS_URLS = (process.env.WS_URLS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 const wsProviders = WS_URLS.map(url => new ethers.WebSocketProvider(url));
 
 if (wsProviders.length === 0) {
-  throw new Error("❌ No WebSocket URLs found in .env (example: WS_URLS=wss://alchemy...,wss://quiknode...)");
+  throw new Error('❌ No WebSocket URLs found in .env (example: WS_URLS=wss://alchemy...,wss://quiknode...)');
 }
 
 let _wsRingIdx = 0;
@@ -39,7 +37,7 @@ async function wsCallWithFallback(label, callFn, opts = {}) {
   const withTimeout = (p) =>
     Promise.race([
       p,
-      new Promise((_, rej) => setTimeout(() => rej(new Error("ws_timeout")), timeoutMs)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('ws_timeout')), timeoutMs)),
     ]);
 
   for (let i = 0; i < wsProviders.length; i++) {
@@ -49,14 +47,14 @@ async function wsCallWithFallback(label, callFn, opts = {}) {
       const res = await withTimeout(callFn(prov));
       _wsRingIdx++;
       return { ok: true, result: res, provider: prov };
-    } catch {}
+    } catch {} // keep exact behavior
   }
   return { ok: false, error: `ws_fallback_failed:${label}` };
 }
 
 // ---------- FLASH-LOAN TOKEN FALLBACK CONFIG ----------
-const FLASH_FALLBACK_TOKENS = (process.env.FLASH_FALLBACK_TOKENS || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
+const FLASH_FALLBACK_TOKENS = (process.env.FLASH_FALLBACK_TOKENS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 function _resolveFlashFallbackTokens(runtimeList) {
   const list = (runtimeList && runtimeList.length ? runtimeList : FLASH_FALLBACK_TOKENS);
@@ -65,27 +63,27 @@ function _resolveFlashFallbackTokens(runtimeList) {
 
 // ---------- ABIs ----------
 const ERC20_ABI = [
-  "function decimals() view returns (uint8)",
-  "function symbol() view returns (string)",
-  "function balanceOf(address) view returns (uint256)"
+  'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
+  'function balanceOf(address) view returns (uint256)'
 ];
 
 const V2_PAIR_ABI = [
-  "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
-  "function token0() view returns (address)",
-  "function token1() view returns (address)"
+  'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)'
 ];
 
 const V3_POOL_ABI = [
-  "function liquidity() view returns (uint128)",
-  "function slot0() view returns (uint160 sqrtPriceX96,int24 tick,int24 observationIndex,int24 observationCardinality,int24 observationCardinalityNext,uint8 feeProtocol,bool unlocked)",
-  "function token0() view returns (address)",
-  "function token1() view returns (address)"
+  'function liquidity() view returns (uint128)',
+  'function slot0() view returns (uint160 sqrtPriceX96,int24 tick,int24 observationIndex,int24 observationCardinality,int24 observationCardinalityNext,uint8 feeProtocol,bool unlocked)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)'
 ];
 
 const AGG_V3_ABI = [
-  "function decimals() view returns (uint8)",
-  "function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)"
+  'function decimals() view returns (uint8)',
+  'function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)'
 ];
 
 // ---------- STATE ----------
@@ -95,7 +93,7 @@ const lastActionAt = new Map();
 
 // 1) SLIPPAGE
 function validateSlippage(expectedOut, minOut) {
-  if (expectedOut <= 0n) return { ok: false, slippageBps: 10000, reason: "expectedOut<=0" };
+  if (expectedOut <= 0n) return { ok: false, slippageBps: 10000, reason: 'expectedOut<=0' };
   const diff = expectedOut - minOut;
   const slippageBps = diff <= 0n ? 0 : Number((diff * 10000n) / expectedOut);
   return { ok: minOut <= expectedOut && slippageBps <= MAX_SLIPPAGE_BPS, slippageBps, maxSlippageBps: MAX_SLIPPAGE_BPS };
@@ -103,22 +101,22 @@ function validateSlippage(expectedOut, minOut) {
 
 // 2) GAS
 async function assessGas(txRequest) {
-  const gp = await wsCallWithFallback("gasPrice", p => p.getFeeData().then(fd => fd.gasPrice), { timeoutMs: GAS_PRICE_TIMEOUT_MS });
-  if (!gp.ok) return { ok: false, reason: "gasPriceFail" };
+  const gp = await wsCallWithFallback('gasPrice', p => p.getFeeData().then(fd => fd.gasPrice), { timeoutMs: GAS_PRICE_TIMEOUT_MS });
+  if (!gp.ok) return { ok: false, reason: 'gasPriceFail' };
   const gasPrice = txRequest.gasPrice ?? gp.result;
-  if (gasPrice > HIGH_GAS_GWEI) return { ok: false, reason: "gasPriceTooHigh", gasPrice };
+  if (gasPrice > HIGH_GAS_GWEI) return { ok: false, reason: 'gasPriceTooHigh', gasPrice };
 
-  const eg = await wsCallWithFallback("estimateGas", p => p.estimateGas(txRequest), { timeoutMs: ESTIMATE_GAS_TIMEOUT_MS });
+  const eg = await wsCallWithFallback('estimateGas', p => p.estimateGas(txRequest), { timeoutMs: ESTIMATE_GAS_TIMEOUT_MS });
   const gasLimit = txRequest.gasLimit ?? (eg.ok ? eg.result : 0n);
-  if (gasLimit === 0n) return { ok: false, reason: "gasEstimationFailed" };
-  if (gasLimit > GAS_LIMIT_MAX) return { ok: false, reason: "gasLimitTooHigh", gasLimit };
+  if (gasLimit === 0n) return { ok: false, reason: 'gasEstimationFailed' };
+  if (gasLimit > GAS_LIMIT_MAX) return { ok: false, reason: 'gasLimitTooHigh', gasLimit };
   return { ok: true, gasPrice, gasLimit };
 }
 
 // 3) PROFIT THRESHOLD (simple USD inputs)
 function meetsProfitThresholdUSD(profitUsd, notionalUsd) {
   if (!Number.isFinite(profitUsd) || !Number.isFinite(notionalUsd) || notionalUsd <= 0)
-    return { ok: false, reason: "invalidInputs", thresholdBps: PROFIT_THRESHOLD_BPS, thresholdUsd: PROFIT_THRESHOLD_USD };
+    return { ok: false, reason: 'invalidInputs', thresholdBps: PROFIT_THRESHOLD_BPS, thresholdUsd: PROFIT_THRESHOLD_USD };
   const profitBps = (profitUsd / notionalUsd) * 10000;
   return { ok: profitBps >= PROFIT_THRESHOLD_BPS && profitUsd >= PROFIT_THRESHOLD_USD, profitBps, profitUsd };
 }
@@ -140,7 +138,7 @@ async function meetsProfitThresholdUSD_Chainlink(provider, { profitToken, profit
     ]);
 
     if (!profitPrice || !notionalPrice) {
-      return { ok: false, reason: "missingFeed" };
+      return { ok: false, reason: 'missingFeed' };
     }
 
     const profitUsd = Number(ethers.formatUnits(profitAmountWei, 18)) * profitPrice;
@@ -148,7 +146,7 @@ async function meetsProfitThresholdUSD_Chainlink(provider, { profitToken, profit
 
     return meetsProfitThresholdUSD(profitUsd, notionalUsd);
   } catch {
-    return { ok: false, reason: "chainlinkError" };
+    return { ok: false, reason: 'chainlinkError' };
   }
 }
 
@@ -163,11 +161,11 @@ function enforceCooldown(key) {
 
 // 5) FLASHLOAN AVAILABILITY (Aave + Balancer controlled via .env)
 async function isFlashLoanAvailable(candidates = []) {
-  const AAVE_LOAN = (process.env.AAVE_LOAN || "false").toLowerCase() === "true";
-  const BAL_LOAN  = (process.env.BAL_LOAN || "false").toLowerCase() === "true";
+  const AAVE_LOAN = (process.env.AAVE_LOAN || 'false').toLowerCase() === 'true';
+  const BAL_LOAN  = (process.env.BAL_LOAN || 'false').toLowerCase() === 'true';
 
   if (!AAVE_LOAN && !BAL_LOAN) {
-    return { ok: false, reason: "loansDisabledInEnv" };
+    return { ok: false, reason: 'loansDisabledInEnv' };
   }
 
   let aaveOk = false;
@@ -184,7 +182,7 @@ async function isFlashLoanAvailable(candidates = []) {
   }
 
   if (AAVE_LOAN) {
-    const aaveCandidates = candidates.filter(c => c.type === "aave");
+    const aaveCandidates = candidates.filter(c => c.type === 'aave');
     for (const c of aaveCandidates) {
       if (await checkBalance(c.token, c.addr, c.needed)) {
         aaveOk = true;
@@ -194,7 +192,7 @@ async function isFlashLoanAvailable(candidates = []) {
   }
 
   if (BAL_LOAN) {
-    const balCandidates = candidates.filter(c => c.type === "balancer");
+    const balCandidates = candidates.filter(c => c.type === 'balancer');
     for (const c of balCandidates) {
       if (await checkBalance(c.token, c.addr, c.needed)) {
         balOk = true;
@@ -206,7 +204,7 @@ async function isFlashLoanAvailable(candidates = []) {
   if (aaveOk || balOk) {
     return { ok: true, aave: aaveOk, balancer: balOk };
   } else {
-    return { ok: false, reason: "noLiquidity", aave: aaveOk, balancer: balOk };
+    return { ok: false, reason: 'noLiquidity', aave: aaveOk, balancer: balOk };
   }
 }
 
@@ -223,7 +221,7 @@ async function chooseFallbackToken(wallet, tokens, minAmt = 0n) {
 async function hasWalletBalance(wallet, token, needed) {
   const minRequiredWei = BigInt(needed);
   if (token === ethers.ZeroAddress) {
-    const bal = await wsCallWithFallback("getBalance", p => p.getBalance(wallet));
+    const bal = await wsCallWithFallback('getBalance', p => p.getBalance(wallet));
     return { ok: bal.ok && bal.result >= minRequiredWei, balance: bal.result };
   }
   const erc = await wsCallWithFallback(`erc20.balanceOf:${token}`, p => new ethers.Contract(token, ERC20_ABI, p).balanceOf(wallet));
@@ -260,7 +258,7 @@ async function getV3State(pool) {
 function isMEVRisk() {
   try {
     if (!fs.existsSync(MEV_FILE)) return { risk: false };
-    const q = JSON.parse(fs.readFileSync(MEV_FILE, "utf-8"));
+    const q = JSON.parse(fs.readFileSync(MEV_FILE, 'utf-8'));
     const now = Date.now();
     return { risk: q.some(e => now - (e.timestamp || 0) < MEV_LOOKBACK_MS) };
   } catch { return { risk: true }; }
@@ -273,11 +271,11 @@ async function runProtections(params) {
     wallet, v2PairAddr, v3PoolAddr,
     fallbackTokens = [], neededBalance, flashCandidates = [] } = params;
 
-  if (!enforceCooldown(routeKey).ok) return { ok: false, reason: "cooldown" };
-  if (isMEVRisk().risk) return { ok: false, reason: "mevRisk" };
+  if (!enforceCooldown(routeKey).ok) return { ok: false, reason: 'cooldown' };
+  if (isMEVRisk().risk) return { ok: false, reason: 'mevRisk' };
 
   const slip = validateSlippage(expectedOut, minOut);
-  if (!slip.ok) return { ok: false, reason: "slippage", details: slip };
+  if (!slip.ok) return { ok: false, reason: 'slippage', details: slip };
 
   let pt;
   if (Number.isFinite(profitUsd) && Number.isFinite(notionalUsd)) {
@@ -285,19 +283,19 @@ async function runProtections(params) {
   } else {
     pt = await meetsProfitThresholdUSD_Chainlink(wsProviders[0], { profitToken, profitAmountWei, notionalToken, notionalAmountWei, feedMap });
   }
-  if (!pt.ok) return { ok: false, reason: "profitBelowThreshold", details: pt };
+  if (!pt.ok) return { ok: false, reason: 'profitBelowThreshold', details: pt };
 
   const gas = await assessGas(txRequest);
-  if (!gas.ok) return { ok: false, reason: "gasBad", details: gas };
+  if (!gas.ok) return { ok: false, reason: 'gasBad', details: gas };
 
   if (neededBalance?.token) {
     const wb = await hasWalletBalance(wallet, neededBalance.token, neededBalance.amountWei);
-    if (!wb.ok) return { ok: false, reason: "insufficientBalance", details: wb };
+    if (!wb.ok) return { ok: false, reason: 'insufficientBalance', details: wb };
   }
 
   if (flashCandidates.length) {
     const fl = await isFlashLoanAvailable(flashCandidates);
-    if (!fl.ok) return { ok: false, reason: "flashNotAvailable", details: fl };
+    if (!fl.ok) return { ok: false, reason: 'flashNotAvailable', details: fl };
   }
 
   const reserves = v2PairAddr ? await getV2Reserves(v2PairAddr) : v3PoolAddr ? await getV3State(v3PoolAddr) : null;
@@ -307,8 +305,8 @@ async function runProtections(params) {
   return { ok: true, details: { slip, pt, gas, reserves, fallback, lock } };
 }
 
-// ---------- EXPORT ----------
-module.exports = {
+// ---------- EXPORT (ESM) ----------
+export {
   validateSlippage,
   assessGas,
   meetsProfitThresholdUSD,
