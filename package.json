@@ -1,15 +1,24 @@
 {
-  "name": "hybrid-arbitrage-bot",
+  "name": "hybrid-simulation-bot",
   "version": "1.0.0",
-  "description": "Hybrid arbitrage bot for Aave and Balancer flash loans, deployed on Railway",
+  "description": "Polygon arbitrage scanner/bot using Ethers v6",
   "private": true,
-  "main": "hybridsimulationbot.js",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "start": "node hybridsimulationbot.js"
+    "start": "node hybridsimulationbot.js",
+    "scanner": "node scanner.js",
+    "poolfetcher": "node poolfetcher.js",
+    "dataprovider": "node dataprovider.js",
+    "protect-test": "node protectionutilities.js",
+    "all": "concurrently \"npm run scanner\" \"npm run poolfetcher\" \"npm run dataprovider\""
   },
   "dependencies": {
-    "axios": "^1.6.7",
-    "dotenv": "^16.3.1",
-    "ethers": "^6.11.1"
+    "axios": "^1.6.0",
+    "dotenv": "^16.4.0",
+    "ethers": "^6.0.0",
+    "concurrently": "^9.0.0"
   }
 }
