@@ -1,5 +1,5 @@
-const fs = require('fs');
-const axios = require('axios');
+import fs from "fs";
+import axios from "axios";
 
 // List of tokens to track (for demonstration, this list should contain up to 200 tokens)
 const tokens = [
@@ -64,3 +64,4 @@ updateTokenlist();
 
 // Optional: Update every 5 minutes
 setInterval(updateTokenlist, 5 * 60 * 1000); // Update every 5 minutes
+
