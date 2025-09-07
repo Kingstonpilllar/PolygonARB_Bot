@@ -1,338 +1,323 @@
-// scanner.js
+// protectionutilities.js  — Ethers v6 (ESM) with your 11 protections unchanged
+// To use: ensure "type": "module" in package.json
 
-require('dotenv').config();
+import 'dotenv/config';
+import fs from 'fs';
+import { ethers } from 'ethers';
 
-const fs = require('fs');
-const path = require('path');
-const { ethers } = require('ethers');
+// ---------- ENV CONFIG ----------
+const PROFIT_THRESHOLD_BPS = Number(process.env.PROFIT_THRESHOLD_BPS || 100);
+const PROFIT_THRESHOLD_USD = Number(process.env.PROFIT_THRESHOLD_USD || 0);
+const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 3000);
 
-/* =========================
-   Config & boot
-========================= */
-const MEV_FILE = path.join(process.cwd(), 'mev_queue.json');
+const MAX_SLIPPAGE_BPS = Number(process.env.MAX_SLIPPAGE_BPS || 100);
+const HIGH_GAS_GWEI = ethers.parseUnits(process.env.HIGH_GAS_GWEI || '300', 'gwei');
+const GAS_LIMIT_MAX = BigInt(process.env.GAS_LIMIT_MAX || '2000000');
+const GAS_PRICE_TIMEOUT_MS = Number(process.env.GAS_PRICE_TIMEOUT_MS || 1200);
+const ESTIMATE_GAS_TIMEOUT_MS = Number(process.env.ESTIMATE_GAS_TIMEOUT_MS || 1800);
 
+const MEV_FILE = process.env.MEV_FILE || './mev_queue.json';
+const MEV_LOOKBACK_MS = Number(process.env.MEV_LOOKBACK_MS || 10_000);
+
+// ---------- WebSocket Providers ----------
 const WS_URLS = (process.env.WS_URLS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-if (!WS_URLS.length) {
-  console.warn('тЪая╕П  WS_URLS is empty; scanner will not start.');
-  return;
+const wsProviders = WS_URLS.map(url => new ethers.WebSocketProvider(url));
+
+if (wsProviders.length === 0) {
+  throw new Error('❌ No WebSocket URLs found in .env (example: WS_URLS=wss://alchemy...,wss://quiknode...)');
 }
 
-let routers = {};
-try { routers = require('./routers.json'); }
-catch { routers = {}; console.warn('тЪая╕П  routers.json missing/invalid; router-target checks will be reduced.'); }
+let _wsRingIdx = 0;
+async function wsCallWithFallback(label, callFn, opts = {}) {
+  const timeoutMs = Number(opts.timeoutMs ?? 1200);
+  const startIdx = _wsRingIdx % wsProviders.length;
 
-const ROUTER_SET = new Set(
-  Object.values(routers || {})
-    .filter(v => typeof v === 'string' && /^0x[a-fA-F0-9]{40}$/.test(v))
-    .map(v => v.toLowerCase())
-);
+  const withTimeout = (p) =>
+    Promise.race([
+      p,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('ws_timeout')), timeoutMs)),
+    ]);
 
-// Gas threshold (GWEI) for simple MEV signal
-const HIGH_GAS_LIMIT = (() => {
-  try { return (ethers.utils || ethers).parseUnits(String(process.env.HIGH_GAS_GWEI || '300'), 'gwei'); }
-  catch { return (ethers.utils || ethers).parseUnits('300', 'gwei'); }
-})();
-
-/* =========================
-   Retention (NEW)
-   - keep only last N hours (default 24)
-========================= */
-const SCANNER_MEV_MAX_AGE_HOURS = Number(process.env.SCANNER_MEV_MAX_AGE_HOURS || 24);
-const MAX_AGE_MS = Math.max(1, SCANNER_MEV_MAX_AGE_HOURS) * 60 * 60 * 1000;
-
-/** Read queue safely */
-function safeReadQueue() {
-  try {
-    if (!fs.existsSync(MEV_FILE)) return [];
-    const raw = fs.readFileSync(MEV_FILE, 'utf8');
-    return JSON.parse(raw || '[]');
-  } catch { return []; }
-}
-
-/** NEW: prune entries older than MAX_AGE_MS */
-function pruneMevQueue(now = Date.now()) {
-  try {
-    const queue = safeReadQueue();
-    if (!Array.isArray(queue) || queue.length === 0) return 0;
-    const cutoff = now - MAX_AGE_MS;
-    const fresh = queue.filter(e => {
-      const ts = Number(e?.timestamp || 0);
-      return Number.isFinite(ts) && ts >= cutoff;
-    });
-    if (fresh.length !== queue.length) {
-      fs.writeFileSync(MEV_FILE, JSON.stringify(fresh, null, 2));
-      console.log(`🧹 Pruned MEV queue: kept ${fresh.length}, removed ${queue.length - fresh.length} (>${SCANNER_MEV_MAX_AGE_HOURS}h old)`);
-      return queue.length - fresh.length;
-    }
-    return 0;
-  } catch (e) {
-    console.warn('⚠️  pruneMevQueue failed:', e?.message || e);
-    return 0;
-  }
-}
-
-/** Schedule periodic prune (hourly is fine; keeps file fresh daily) */
-function schedulePrune() {
-  // initial prune on boot
-  pruneMevQueue();
-  // prune every hour
-  setInterval(() => pruneMevQueue(), 60 * 60 * 1000);
-}
-schedulePrune();
-
-/* =========================
-   ABIs & Interface helpers
-========================= */
-// ethers v5: ethers.utils.Interface; v6: ethers.Interface
-const InterfaceCtor = ethers.Interface || (ethers.utils && ethers.utils.Interface);
-
-// Uniswap V2 Router (fragments we care about)
-const V2_IFACE = new InterfaceCtor([
-  'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)',
-  'function swapExactETHForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline)',
-  'function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)'
-]);
-
-// Uniswap V3 SwapRouter (fragments we care about)
-// exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))
-const V3_IFACE = new InterfaceCtor([
-  'function exactInputSingle(tuple(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) params) returns (uint256 amountOut)',
-  'function exactInput(bytes path, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum) returns (uint256 amountOut)',
-  // Optional: many routers expose multicall(bytes[]) – we decode inner calls if present
-  'function multicall(bytes[] data) returns (bytes[] results)'
-]);
-
-/* =========================
-   Utils
-========================= */
-
-/** (UPDATED) Log with pre-prune to ensure file stays within window */
-function logToMevQueue(entry) {
-  // prune first so we never grow beyond the retention window
-  pruneMevQueue();
-
-  const queue = safeReadQueue();
-  if (!queue.some(q => q.hash === entry.hash)) {
-    queue.push(entry);
-    fs.writeFileSync(MEV_FILE, JSON.stringify(queue, null, 2));
-    console.log(`ЁЯЪи MEV risk logged: ${entry.hash}`);
-  }
-}
-
-function isRouterTarget(to) {
-  if (!to) return false;
-  try { return ROUTER_SET.has(to.toLowerCase()); } catch { return false; }
-}
-
-function getEffectiveGasPrice(tx) {
-  return tx.maxFeePerGas || tx.gasPrice || null;
-}
-
-// v5/v6 compatible WebSocketProvider
-function makeWsProvider(url) {
-  const Ctor = (ethers.providers && ethers.providers.WebSocketProvider)
-    ? ethers.providers.WebSocketProvider
-    : ethers.WebSocketProvider;
-  return new Ctor(url);
-}
-
-/* =========================
-   Decoders
-========================= */
-function decodeV2Swap(data) {
-  try {
-    const parsed = V2_IFACE.parseTransaction({ data });
-    const fn = parsed.name;
-
-    if (fn === 'swapExactTokensForTokens') {
-      const [amountIn, amountOutMin, path, to] = parsed.args;
-      return {
-        protocol: 'V2',
-        method: fn,
-        tokens: path.map(a => String(a)),
-        amountIn: amountIn.toString(),
-        minOut: amountOutMin.toString(),
-        recipient: String(to)
-      };
-    }
-
-    if (fn === 'swapExactETHForTokens') {
-      const [amountOutMin, path, to] = parsed.args;
-      return {
-        protocol: 'V2',
-        method: fn,
-        tokens: path.map(a => String(a)), // input is native; first token is the out token
-        amountIn: 'NATIVE',               // cannot know exact from calldata (comes from tx.value)
-        minOut: amountOutMin.toString(),
-        recipient: String(to)
-      };
-    }
-
-    if (fn === 'swapExactTokensForETH') {
-      const [amountIn, amountOutMin, path, to] = parsed.args;
-      return {
-        protocol: 'V2',
-        method: fn,
-        tokens: path.map(a => String(a)), // last hop out is native
-        amountIn: amountIn.toString(),
-        minOut: amountOutMin.toString(),
-        recipient: String(to)
-      };
-    }
-  } catch (_) {}
-  return null;
-}
-
-function decodeV3Path(pathBytes) {
-  // V3 path = token(20) [fee(3) token(20)]*
-  const tokens = [];
-  const hex = pathBytes.slice(2); // strip 0x
-  let i = 0;
-  while (i + 40 <= hex.length) {
-    const token = '0x' + hex.slice(i, i + 40);
-    tokens.push(ethers.utils ? ethers.utils.getAddress(token) : ethers.getAddress(token));
-    i += 40;
-    if (i + 6 > hex.length) break; // no room for fee => end
-    i += 6; // skip fee (3 bytes)
-  }
-  return tokens;
-}
-
-function decodeV3Swap(data) {
-  try {
-    const parsed = V3_IFACE.parseTransaction({ data });
-    const fn = parsed.name;
-
-    if (fn === 'exactInputSingle') {
-      const p = parsed.args[0]; // tuple
-      return {
-        protocol: 'V3',
-        method: fn,
-        tokens: [String(p.tokenIn), String(p.tokenOut)],
-        amountIn: p.amountIn.toString(),
-        minOut: p.amountOutMinimum.toString(),
-        recipient: String(p.recipient),
-        fee: Number(p.fee)
-      };
-    }
-
-    if (fn === 'exactInput') {
-      const [pathBytes, recipient, /*deadline*/, amountIn, amountOutMinimum] = parsed.args;
-      const tokens = decodeV3Path(String(pathBytes));
-      return {
-        protocol: 'V3',
-        method: fn,
-        tokens,
-        amountIn: amountIn.toString(),
-        minOut: amountOutMinimum.toString(),
-        recipient: String(recipient)
-      };
-    }
-
-    if (fn === 'multicall') {
-      // Try to decode inner calls; collect all swap-like items
-      const calls = parsed.args[0] || [];
-      const inner = [];
-      for (const c of calls) {
-        const hex = String(c);
-        const one = decodeV2Swap(hex) || decodeV3Swap(hex);
-        if (one) inner.push(one);
-      }
-      if (inner.length) {
-        return { protocol: 'MULTICALL', method: 'multicall', inner };
-      }
-    }
-  } catch (_) {}
-  return null;
-}
-
-function decodeSwapCalldata(data) {
-  // Try V2 first, then V3
-  return decodeV2Swap(data) || decodeV3Swap(data);
-}
-
-/* =========================
-   Scanner
-========================= */
-function startScanner(url, index, attempt = 0) {
-  const label = `[WS ${index}]`;
-  const backoffMs = Math.min(30_000, 2000 * Math.max(1, attempt));
-
-  let provider;
-  try { provider = makeWsProvider(url); }
-  catch (e) {
-    console.warn(`${label} Provider init failed: ${e.message}. Retrying in ${backoffMs} ms`);
-    return setTimeout(() => startScanner(url, index, attempt + 1), backoffMs);
-  }
-
-  provider.getNetwork?.().then(n => {
-    console.log(`${label} Connected: ${url} (chainId ${n?.chainId ?? 'unknown'})`);
-  }).catch(() => console.log(`${label} Connected: ${url}`));
-
-  provider.on('pending', async (txHash) => {
+  for (let i = 0; i < wsProviders.length; i++) {
+    const idx = (startIdx + i) % wsProviders.length;
+    const prov = wsProviders[idx];
     try {
-      const tx = await provider.getTransaction(txHash);
-      if (!tx) return;
+      const res = await withTimeout(callFn(prov));
+      _wsRingIdx++;
+      return { ok: true, result: res, provider: prov };
+    } catch {} // keep exact behavior
+  }
+  return { ok: false, error: `ws_fallback_failed:${label}` };
+}
 
-      const effGas = getEffectiveGasPrice(tx);
-      const gasIsHigh = effGas ? effGas.gt(HIGH_GAS_LIMIT) : false;
-      const hitsRouter = isRouterTarget(tx.to);
+// ---------- FLASH-LOAN TOKEN FALLBACK CONFIG ----------
+const FLASH_FALLBACK_TOKENS = (process.env.FLASH_FALLBACK_TOKENS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
-      // Try to decode tokens/amounts only when it looks relevant (router or high gas)
-      let decoded = null;
-      if (hitsRouter || gasIsHigh) {
-        if (tx.data && tx.data !== '0x') {
-          decoded = decodeSwapCalldata(tx.data);
-        }
-      }
+function _resolveFlashFallbackTokens(runtimeList) {
+  const list = (runtimeList && runtimeList.length ? runtimeList : FLASH_FALLBACK_TOKENS);
+  return list.slice(0, 5);
+}
 
-      if (gasIsHigh || hitsRouter || decoded) {
-        const entry = {
-          hash: tx.hash,
-          from: tx.from,
-          to: tx.to,
-          gasPrice: effGas ? effGas.toString() : null,
-          timestamp: Date.now()
-        };
+// ---------- ABIs ----------
+const ERC20_ABI = [
+  'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
+  'function balanceOf(address) view returns (uint256)'
+];
 
-        if (decoded) entry.decoded = decoded;
-        // tx.value is important for swapExactETHForTokens etc.
-        if (tx.value) entry.txValue = tx.value.toString();
+const V2_PAIR_ABI = [
+  'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)'
+];
 
-        logToMevQueue(entry);
-      }
-    } catch (_) {
-      // Keep stream alive
+const V3_POOL_ABI = [
+  'function liquidity() view returns (uint128)',
+  'function slot0() view returns (uint160 sqrtPriceX96,int24 tick,int24 observationIndex,int24 observationCardinality,int24 observationCardinalityNext,uint8 feeProtocol,bool unlocked)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)'
+];
+
+const AGG_V3_ABI = [
+  'function decimals() view returns (uint8)',
+  'function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)'
+];
+
+// ---------- STATE ----------
+const lastActionAt = new Map();
+
+// ============= 11 PROTECTIONS =============
+
+// 1) SLIPPAGE
+function validateSlippage(expectedOut, minOut) {
+  if (expectedOut <= 0n) return { ok: false, slippageBps: 10000, reason: 'expectedOut<=0' };
+  const diff = expectedOut - minOut;
+  const slippageBps = diff <= 0n ? 0 : Number((diff * 10000n) / expectedOut);
+  return { ok: minOut <= expectedOut && slippageBps <= MAX_SLIPPAGE_BPS, slippageBps, maxSlippageBps: MAX_SLIPPAGE_BPS };
+}
+
+// 2) GAS
+async function assessGas(txRequest) {
+  const gp = await wsCallWithFallback('gasPrice', p => p.getFeeData().then(fd => fd.gasPrice), { timeoutMs: GAS_PRICE_TIMEOUT_MS });
+  if (!gp.ok) return { ok: false, reason: 'gasPriceFail' };
+  const gasPrice = txRequest.gasPrice ?? gp.result;
+  if (gasPrice > HIGH_GAS_GWEI) return { ok: false, reason: 'gasPriceTooHigh', gasPrice };
+
+  const eg = await wsCallWithFallback('estimateGas', p => p.estimateGas(txRequest), { timeoutMs: ESTIMATE_GAS_TIMEOUT_MS });
+  const gasLimit = txRequest.gasLimit ?? (eg.ok ? eg.result : 0n);
+  if (gasLimit === 0n) return { ok: false, reason: 'gasEstimationFailed' };
+  if (gasLimit > GAS_LIMIT_MAX) return { ok: false, reason: 'gasLimitTooHigh', gasLimit };
+  return { ok: true, gasPrice, gasLimit };
+}
+
+// 3) PROFIT THRESHOLD (simple USD inputs)
+function meetsProfitThresholdUSD(profitUsd, notionalUsd) {
+  if (!Number.isFinite(profitUsd) || !Number.isFinite(notionalUsd) || notionalUsd <= 0)
+    return { ok: false, reason: 'invalidInputs', thresholdBps: PROFIT_THRESHOLD_BPS, thresholdUsd: PROFIT_THRESHOLD_USD };
+  const profitBps = (profitUsd / notionalUsd) * 10000;
+  return { ok: profitBps >= PROFIT_THRESHOLD_BPS && profitUsd >= PROFIT_THRESHOLD_USD, profitBps, profitUsd };
+}
+
+// 3b) PROFIT THRESHOLD via CHAINLINK feeds
+async function meetsProfitThresholdUSD_Chainlink(provider, { profitToken, profitAmountWei, notionalToken, notionalAmountWei, feedMap }) {
+  try {
+    async function fetchPrice(token) {
+      const feedAddr = feedMap?.[token];
+      if (!feedAddr) return null;
+      const c = new ethers.Contract(feedAddr, AGG_V3_ABI, provider);
+      const [dec, rd] = await Promise.all([c.decimals(), c.latestRoundData()]);
+      return Number(rd[1]) / 10 ** dec;
     }
-  });
 
-  // v5 raw ws hooks (if present)
-  const ws = provider._websocket;
-  if (ws && typeof ws.on === 'function') {
-    ws.on('close', () => {
-      console.warn(`${label} Closed. Reconnecting in ${backoffMs} ms...`);
-      try { provider.destroy?.(); } catch {}
-      setTimeout(() => startScanner(url, index, attempt + 1), backoffMs);
-    });
-    ws.on('error', (e) => {
-      console.warn(`${label} Socket error: ${e?.message || e}`);
-    });
-  } else {
-    // v6 fallback: periodic ping to detect drop
-    const ping = setInterval(async () => {
-      try { await provider.getBlockNumber(); }
-      catch {
-        clearInterval(ping);
-        console.warn(`${label} Lost connection. Reconnecting in ${backoffMs} ms...`);
-        try { provider.destroy?.(); } catch {}
-        setTimeout(() => startScanner(url, index, attempt + 1), backoffMs);
-      }
-    }, 15_000);
+    const [profitPrice, notionalPrice] = await Promise.all([
+      fetchPrice(profitToken),
+      fetchPrice(notionalToken),
+    ]);
+
+    if (!profitPrice || !notionalPrice) {
+      return { ok: false, reason: 'missingFeed' };
+    }
+
+    const profitUsd = Number(ethers.formatUnits(profitAmountWei, 18)) * profitPrice;
+    const notionalUsd = Number(ethers.formatUnits(notionalAmountWei, 18)) * notionalPrice;
+
+    return meetsProfitThresholdUSD(profitUsd, notionalUsd);
+  } catch {
+    return { ok: false, reason: 'chainlinkError' };
   }
 }
 
-WS_URLS.forEach((url, i) => startScanner(url, i));
+// 4) COOLDOWN
+function enforceCooldown(key) {
+  const now = Date.now();
+  const last = lastActionAt.get(key) || 0;
+  if (now - last < COOLDOWN_MS) return { ok: false, msRemaining: COOLDOWN_MS - (now - last) };
+  lastActionAt.set(key, now);
+  return { ok: true };
+}
+
+// 5) FLASHLOAN AVAILABILITY (Aave + Balancer controlled via .env)
+async function isFlashLoanAvailable(candidates = []) {
+  const AAVE_LOAN = (process.env.AAVE_LOAN || 'false').toLowerCase() === 'true';
+  const BAL_LOAN  = (process.env.BAL_LOAN || 'false').toLowerCase() === 'true';
+
+  if (!AAVE_LOAN && !BAL_LOAN) {
+    return { ok: false, reason: 'loansDisabledInEnv' };
+  }
+
+  let aaveOk = false;
+  let balOk = false;
+
+  async function checkBalance(token, addr, needed) {
+    for (const p of wsProviders) {
+      try {
+        const bal = await new ethers.Contract(token, ERC20_ABI, p).balanceOf(addr);
+        if (bal >= BigInt(needed)) return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  if (AAVE_LOAN) {
+    const aaveCandidates = candidates.filter(c => c.type === 'aave');
+    for (const c of aaveCandidates) {
+      if (await checkBalance(c.token, c.addr, c.needed)) {
+        aaveOk = true;
+        break;
+      }
+    }
+  }
+
+  if (BAL_LOAN) {
+    const balCandidates = candidates.filter(c => c.type === 'balancer');
+    for (const c of balCandidates) {
+      if (await checkBalance(c.token, c.addr, c.needed)) {
+        balOk = true;
+        break;
+      }
+    }
+  }
+
+  if (aaveOk || balOk) {
+    return { ok: true, aave: aaveOk, balancer: balOk };
+  } else {
+    return { ok: false, reason: 'noLiquidity', aave: aaveOk, balancer: balOk };
+  }
+}
+
+// 6) FALLBACK TOKEN
+async function chooseFallbackToken(wallet, tokens, minAmt = 0n) {
+  for (const t of tokens) {
+    const res = await wsCallWithFallback(`erc20.balanceOf:${t}`, p => new ethers.Contract(t, ERC20_ABI, p).balanceOf(wallet));
+    if (res.ok && res.result > minAmt) return { ok: true, token: t, balance: res.result };
+  }
+  return { ok: false };
+}
+
+// 7) WALLET BALANCE
+async function hasWalletBalance(wallet, token, needed) {
+  const minRequiredWei = BigInt(needed);
+  if (token === ethers.ZeroAddress) {
+    const bal = await wsCallWithFallback('getBalance', p => p.getBalance(wallet));
+    return { ok: bal.ok && bal.result >= minRequiredWei, balance: bal.result };
+  }
+  const erc = await wsCallWithFallback(`erc20.balanceOf:${token}`, p => new ethers.Contract(token, ERC20_ABI, p).balanceOf(wallet));
+  return { ok: erc.ok && erc.result >= minRequiredWei, balance: erc.result };
+}
+
+// 8) PROFIT LOCK
+function lockProfit(profitUsd, lockPct = 0.75) {
+  if (!Number.isFinite(profitUsd) || profitUsd <= 0) return { locked: 0, leftover: 0 };
+  return { locked: profitUsd * lockPct, leftover: profitUsd * (1 - lockPct) };
+}
+
+// 9) V2 RESERVES
+async function getV2Reserves(pair) {
+  const res = await wsCallWithFallback(`v2.getReserves:${pair}`, async p => {
+    const c = new ethers.Contract(pair, V2_PAIR_ABI, p);
+    const [t0, t1, [r0, r1, ts]] = await Promise.all([c.token0(), c.token1(), c.getReserves()]);
+    return { token0: t0, token1: t1, r0, r1, tsLast: Number(ts), ts: Date.now() };
+  });
+  return res.ok ? res.result : null;
+}
+
+// 10) V3 STATE
+async function getV3State(pool) {
+  const res = await wsCallWithFallback(`v3.slot0:${pool}`, async p => {
+    const c = new ethers.Contract(pool, V3_POOL_ABI, p);
+    const [slot0, liquidity, t0, t1] = await Promise.all([c.slot0(), c.liquidity(), c.token0(), c.token1()]);
+    return { token0: t0, token1: t1, sqrtPriceX96: slot0.sqrtPriceX96, liquidity, ts: Date.now() };
+  });
+  return res.ok ? res.result : null;
+}
+
+// 11) MEV RISK
+function isMEVRisk() {
+  try {
+    if (!fs.existsSync(MEV_FILE)) return { risk: false };
+    const q = JSON.parse(fs.readFileSync(MEV_FILE, 'utf-8'));
+    const now = Date.now();
+    return { risk: q.some(e => now - (e.timestamp || 0) < MEV_LOOKBACK_MS) };
+  } catch { return { risk: true }; }
+}
+
+// ---------- COMPOSED GUARD ----------
+async function runProtections(params) {
+  const { routeKey, expectedOut, minOut, txRequest,
+    profitUsd, notionalUsd, profitToken, profitAmountWei, notionalToken, notionalAmountWei, feedMap,
+    wallet, v2PairAddr, v3PoolAddr,
+    fallbackTokens = [], neededBalance, flashCandidates = [] } = params;
+
+  if (!enforceCooldown(routeKey).ok) return { ok: false, reason: 'cooldown' };
+  if (isMEVRisk().risk) return { ok: false, reason: 'mevRisk' };
+
+  const slip = validateSlippage(expectedOut, minOut);
+  if (!slip.ok) return { ok: false, reason: 'slippage', details: slip };
+
+  let pt;
+  if (Number.isFinite(profitUsd) && Number.isFinite(notionalUsd)) {
+    pt = meetsProfitThresholdUSD(profitUsd, notionalUsd);
+  } else {
+    pt = await meetsProfitThresholdUSD_Chainlink(wsProviders[0], { profitToken, profitAmountWei, notionalToken, notionalAmountWei, feedMap });
+  }
+  if (!pt.ok) return { ok: false, reason: 'profitBelowThreshold', details: pt };
+
+  const gas = await assessGas(txRequest);
+  if (!gas.ok) return { ok: false, reason: 'gasBad', details: gas };
+
+  if (neededBalance?.token) {
+    const wb = await hasWalletBalance(wallet, neededBalance.token, neededBalance.amountWei);
+    if (!wb.ok) return { ok: false, reason: 'insufficientBalance', details: wb };
+  }
+
+  if (flashCandidates.length) {
+    const fl = await isFlashLoanAvailable(flashCandidates);
+    if (!fl.ok) return { ok: false, reason: 'flashNotAvailable', details: fl };
+  }
+
+  const reserves = v2PairAddr ? await getV2Reserves(v2PairAddr) : v3PoolAddr ? await getV3State(v3PoolAddr) : null;
+  const fallback = fallbackTokens.length ? await chooseFallbackToken(wallet, fallbackTokens) : null;
+  const lock = lockProfit(pt.profitUsd || profitUsd || 0, 0.75);
+
+  return { ok: true, details: { slip, pt, gas, reserves, fallback, lock } };
+}
+
+// ---------- EXPORT (ESM) ----------
+export {
+  validateSlippage,
+  assessGas,
+  meetsProfitThresholdUSD,
+  meetsProfitThresholdUSD_Chainlink,
+  enforceCooldown,
+  isFlashLoanAvailable,
+  chooseFallbackToken,
+  hasWalletBalance,
+  lockProfit,
+  getV2Reserves,
+  getV3State,
+  isMEVRisk,
+  runProtections
+};
