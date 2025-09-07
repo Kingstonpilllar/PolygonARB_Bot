@@ -1,11 +1,10 @@
-// checkdirectpool.js
-const fs = require("fs");
-const path = require("path");
-const { listenTelegramAlerts, sendTelegramAlert } = require("./telegramalert.js");
+import fs from "fs";
+import path from "path";
+import { listenTelegramAlerts, sendTelegramAlert } from "./telegramalert.js";
 
-const DIRECT_POOL_FILE = path.join(__dirname, "direct_pool.json");
+const DIRECT_POOL_FILE = path.join(process.cwd(), "direct_pool.json");
 
-// Helper: load JSON safely (resilient)
+// Helper: load JSON safely
 function loadDirectPool() {
   try {
     if (fs.existsSync(DIRECT_POOL_FILE)) {
@@ -18,7 +17,7 @@ function loadDirectPool() {
   }
 }
 
-// Helper: save JSON safely (resilient)
+// Helper: save JSON safely
 function saveDirectPool(pool) {
   try {
     fs.writeFileSync(DIRECT_POOL_FILE, JSON.stringify(pool, null, 2));
@@ -28,7 +27,7 @@ function saveDirectPool(pool) {
 }
 
 // Delete tradeId from direct_pool.json
-function removeFromDirectPool(type, tradeId) {
+export function removeFromDirectPool(type, tradeId) {
   try {
     let pool = loadDirectPool();
     const before = pool.length;
@@ -49,10 +48,16 @@ function removeFromDirectPool(type, tradeId) {
 
 // Emoji by trade type
 function getEmoji(type) {
-  if (type === "successful") return "✅";
-  if (type === "skip") return "⏭️";
-  if (type === "fail") return "❌";
-  return "ℹ️";
+  switch (type) {
+    case "successful":
+      return "✅";
+    case "skip":
+      return "⏭️";
+    case "fail":
+      return "❌";
+    default:
+      return "ℹ️";
+  }
 }
 
 // Capitalize first letter
@@ -60,7 +65,7 @@ function capitalize(s) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-// 🔥 Listen for alerts (resilient)
+// 🔥 Listen for Telegram alerts and remove trades from pool
 listenTelegramAlerts(({ type, tradeId }) => {
   if (["successful", "skip", "fail"].includes(type)) {
     removeFromDirectPool(type, tradeId);
