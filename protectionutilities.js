@@ -2,7 +2,7 @@
 // To use: ensure "type": "module" in package.json
 
 import 'dotenv/config';
-import fs from 'fs';
+import fs from 'node:fs';               // ESM-safe core import
 import { ethers } from 'ethers';
 import { getReadProvider, readFailover } from './dataprovider.js';
 
@@ -12,7 +12,7 @@ const PROFIT_THRESHOLD_USD = Number(process.env.PROFIT_THRESHOLD_USD || 0);
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 3000);
 
 const MAX_SLIPPAGE_BPS = Number(process.env.MAX_SLIPPAGE_BPS || 100);
-const HIGH_GAS_GWEI = ethers.parseUnits(process.env.HIGH_GAS_GWEI || '300', 'gwei');
+const HIGH_GAS_GWEI = ethers.parseUnits(process.env.HIGH_GAS_GWEI || '300', 'gwei'); // bigint
 const GAS_LIMIT_MAX = BigInt(process.env.GAS_LIMIT_MAX || '2000000');
 const GAS_PRICE_TIMEOUT_MS = Number(process.env.GAS_PRICE_TIMEOUT_MS || 1200);
 const ESTIMATE_GAS_TIMEOUT_MS = Number(process.env.ESTIMATE_GAS_TIMEOUT_MS || 1800);
@@ -96,7 +96,7 @@ async function assessGas(txRequest) {
   // gasPrice
   const gasPrice = await readCall(
     'gasPrice',
-    p => p.getFeeData().then(fd => txRequest.gasPrice ?? fd.gasPrice),
+    p => p.getFeeData().then(fd => (txRequest?.gasPrice ?? fd.gasPrice)),
     GAS_PRICE_TIMEOUT_MS
   ).catch(() => null);
 
@@ -315,7 +315,7 @@ async function runProtections(params) {
     if (!fl.ok) return { ok: false, reason: 'flashNotAvailable', details: fl };
   }
 
-  const reserves = v2PairAddr ? await getV2Reserves(v2PairAddr) : v3PoolAddr ? await getV3State(v3PoolAddr) : null;
+  const reserves = v2PairAddr ? await getV2Reserves(v2PairAddr) : (v3PoolAddr ? await getV3State(v3PoolAddr) : null);
   const fbTokens = _resolveFlashFallbackTokens(fallbackTokens);
   const fallback = fbTokens.length ? await chooseFallbackToken(wallet, fbTokens) : null;
   const lock = lockProfit(pt.profitUsd || profitUsd || 0, 0.75);
