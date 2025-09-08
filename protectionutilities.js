@@ -2,7 +2,7 @@
 // To use: ensure "type": "module" in package.json
 
 import 'dotenv/config';
-import fs from 'node:fs';
+import * as fs from 'fs';
 import { ethers } from 'ethers';
 import { getReadProvider, readFailover } from './dataprovider.js';
 
@@ -345,3 +345,4 @@ export {
   isMEVRisk,
   runProtections
 };
+
