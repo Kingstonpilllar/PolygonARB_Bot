@@ -1,13 +1,13 @@
-// scanner.js тАФ Ethers v6 only (no websockets), logic preserved
+// scanner.js — Ethers v6 only (no websockets), logic preserved
 
 import 'dotenv/config';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ethers } from 'ethers';
 import { getReadProvider, readFailover } from './dataprovider.js';
 
-   1 /* =========================
+/* =========================
    Paths & Config
 ========================= */
 const __filename = fileURLToPath(import.meta.url);
@@ -17,7 +17,7 @@ const MEV_FILE = path.join(process.cwd(), 'mev_queue.json');
 
 // Removed WS_URLS and related warnings; we now use dataprovider.js read provider.
 
-    2. /* =========================
+/* =========================
    Routers & Gas threshold
 ========================= */
 let routers = {};
@@ -26,7 +26,7 @@ try {
   routers = JSON.parse(raw || '{}');
 } catch {
   routers = {};
-  console.warn('тЪая╕П  routers.json missing/invalid; router-target checks will be reduced.');
+  console.warn('⚠️ routers.json missing/invalid; router-target checks will be reduced.');
 }
 
 const ROUTER_SET = new Set(
@@ -35,13 +35,13 @@ const ROUTER_SET = new Set(
     .map(v => v.toLowerCase())
 );
 
-   3. // Gas threshold (GWEI) for simple MEV signal (v6 returns bigint)
+// Gas threshold (GWEI) for simple MEV signal (v6 returns bigint)
 const HIGH_GAS_LIMIT = (() => {
   try { return ethers.parseUnits(String(process.env.HIGH_GAS_GWEI || '300'), 'gwei'); }
   catch { return ethers.parseUnits('300', 'gwei'); }
 })();
 
-   4. /* =========================
+/* =========================
    Retention (keep last N hours)
 ========================= */
 const SCANNER_MEV_MAX_AGE_HOURS = Number(process.env.SCANNER_MEV_MAX_AGE_HOURS || 24);
@@ -66,22 +66,22 @@ function pruneMevQueue(now = Date.now()) {
     });
     if (fresh.length !== queue.length) {
       fs.writeFileSync(MEV_FILE, JSON.stringify(fresh, null, 2));
-      console.log(`ЁЯз╣ Pruned MEV queue: kept ${fresh.length}, removed ${queue.length - fresh.length} (> ${SCANNER_MEV_MAX_AGE_HOURS}h old)`);
+      console.log(`🧹 Pruned MEV queue: kept ${fresh.length}, removed ${queue.length - fresh.length} (> ${SCANNER_MEV_MAX_AGE_HOURS}h old)`);
       return queue.length - fresh.length;
     }
     return 0;
   } catch (e) {
-    console.warn('тЪая╕П  pruneMevQueue failed:', e?.message || e);
+    console.warn('⚠️ pruneMevQueue failed:', e?.message || e);
     return 0;
   }
 }
 
 (function schedulePrune() {
-  pruneMevQueue();                   // initial prune on boot
+  pruneMevQueue();                         // initial prune on boot
   setInterval(pruneMevQueue, 60 * 60 * 1000); // hourly
 })();
 
-5  /* =========================
+/* =========================
    ABIs & Interfaces (v6)
 ========================= */
 const V2_IFACE = new ethers.Interface([
@@ -96,7 +96,7 @@ const V3_IFACE = new ethers.Interface([
   'function multicall(bytes[] data) returns (bytes[] results)'
 ]);
 
-   6 /* =========================
+/* =========================
    Utils
 ========================= */
 function logToMevQueue(entry) {
@@ -105,7 +105,7 @@ function logToMevQueue(entry) {
   if (!queue.some(q => q.hash === entry.hash)) {
     queue.push(entry);
     fs.writeFileSync(MEV_FILE, JSON.stringify(queue, null, 2));
-    console.log(`тЬЕ MEV risk logged: ${entry.hash}`);
+    console.log(`✅ MEV risk logged: ${entry.hash}`);
   }
 }
 
@@ -115,7 +115,7 @@ function isRouterTarget(to) {
 }
 
 function getEffectiveGasPrice(tx) {
-   7 // v6: bigint or null
+  // v6: bigint or null
   return (tx.maxFeePerGas ?? tx.gasPrice) ?? null;
 }
 
@@ -164,7 +164,7 @@ function decodeV2Swap(data) {
 }
 
 function decodeV3Path(pathBytes) {
-  8  // V3 path = token(20) [fee(3) token(20)]*
+  // V3 path = token(20) [fee(3) token(20)]*
   const tokens = [];
   const hex = String(pathBytes).slice(2);
   let i = 0;
@@ -227,19 +227,19 @@ function decodeSwapCalldata(data) {
   return decodeV2Swap(data) || decodeV3Swap(data);
 }
 
-// 9 /* =========================
-//    Scanner (provider from dataprovider.js; HTTP-only polling)
-// ========================= */
+/* =========================
+   Scanner (provider from dataprovider.js; HTTP-only polling)
+========================= */
 function startScanner() {
   let provider = getReadProvider();
   const label = `[READ]`;
 
-  // 10. // Helpful connect log
+  // Helpful connect log
   provider.getNetwork()
     .then(n => console.log(`${label} Connected (chainId ${n?.chainId ?? 'unknown'})`))
     .catch(() => console.log(`${label} Connected`));
 
-  // 11  // Block poller: fetch latest block with transactions and scan them
+  // Block poller: fetch latest block with transactions and scan them
   let lastProcessed = 0n;
   const pollIntervalMs = 1500;
 
@@ -280,28 +280,28 @@ function startScanner() {
       }
 
       lastProcessed = BigInt(bn);
-    } catch (err) {
+    } catch {
       // swallow; heartbeat below will trigger failover if needed
     }
   }
 
   const poller = setInterval(scanLatestBlock, pollIntervalMs);
-  console.log(`${label} Polling latest blocks every ${pollIntervalMs}msтАж`);
+  console.log(`${label} Polling latest blocks every ${pollIntervalMs}ms…`);
 
-  // 12 // Error handling тАФ rotate read RPC and continue polling
+  // Error handling — rotate read RPC and continue polling
   const onError = async (err) => {
-    console.warn(`${label} Provider error: ${err?.message || err}. Rotating read RPCтАж`);
+    console.warn(`${label} Provider error: ${err?.message || err}. Rotating read RPC…`);
     await readFailover();
     provider = getReadProvider();
   };
-  provider.on('error', onError);
+  provider.on?.('error', onError); // guard: JsonRpcProvider may not emit 'error'
 
-  // 13  // Heartbeat to detect silent drops (rotate via dataprovider on failure)
+  // Heartbeat to detect silent drops (rotate via dataprovider on failure)
   const hbIntervalMs = 15000;
   const hb = setInterval(async () => {
     try { await getReadProvider().getBlockNumber(); }
     catch {
-      console.warn(`${label} Heartbeat failed. Rotating read RPCтАж`);
+      console.warn(`${label} Heartbeat failed. Rotating read RPC…`);
       await readFailover();
     }
   }, hbIntervalMs);
