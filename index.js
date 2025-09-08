@@ -22,7 +22,7 @@ function startModule(name, modulePath) {
 // RPC provider first
 startModule('Data Provider (RPC)', './dataprovider.js');
 
-// WebSocket data suppliers
+// RPC data suppliers
 startModule('Pool Fetcher', './poolfetcher.js');
 startModule('Scanner', './scanner.js');
 startModule('Protection Utilities', './protectionutilities.js');
@@ -35,4 +35,5 @@ startModule('Direct Pool listener', './checkdirectpool.js');
 startModule('Tri Pool listener', './check_tri_pool.js');
 
 console.log('🎯 All services are running. Monitoring trade alerts and supplying pool data...');
+
 
