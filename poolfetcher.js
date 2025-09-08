@@ -1,4 +1,5 @@
-// ESM + Ethers v6 version
+// poolfetcher.js
+// ESM + Ethers v6 version (Polygon-only, HTTP RPC failover; NO .env, NO WebSocket)
 // Dependencies: npm install ethers axios
 // (fs, path, child_process are built-in)
 
@@ -12,7 +13,7 @@ import dexConfig from './dexconfig.json' assert { type: 'json' };
 import { FACTORIES } from './factories.js';
 import factoryABIs from './factory_ABI.js'; // assumed export of ABIs
 
-// 1// === CONFIG (Polygon-only, HTTP RPC failover; NO .env, NO WebSocket) ===
+// 1 // === CONFIG (Polygon-only, HTTP RPC failover; NO .env, NO WebSocket) ===
 const RPC_URLS = [
   'https://polygon-mainnet.g.alchemy.com/v2/C3-3l0i9jKmV2y_07pPCd',
   'https://polygon-bor-rpc.publicnode.com',
@@ -43,7 +44,7 @@ function addLogListener(filter, handler) {
 async function connectProvider() {
   const url = RPC_URLS[currentIndex];
   console.log(`🔌 Connecting HTTP RPC provider: ${url}`);
-  provider = new ethers.JsonRpcProvider(url);
+  provider = new ethers.JsonRpcProvider(url, { name: 'polygon', chainId: 137 });
   provider.pollingInterval = 1500; // snappy polls
   return provider;
 }
@@ -179,12 +180,81 @@ function edgeToProfitUSD(edgeFrac, notionalUSD = NOTIONAL_USD) {
 }
 
 // 3 // === HELPERS ===
-async function getTokenPrices(tokenAddresses) {
-  if (!tokenAddresses.length) return {};
-  const ids = tokenAddresses.map(addr => addr.toLowerCase()).join(',');
-  const url = `https://api.coingecko.com/api/v3/simple/token_price/polygon-pos?contract_addresses=${ids}&vs_currencies=usd`;
-  const resp = await axios.get(url);
-  return resp.data;
+
+// --- CoinGecko safeguards (tuned for reliability) ---
+const CG_CHUNK_SIZE   = 75;      // contracts per request (safe < 100)
+const CG_RATE_MS      = 1200;    // delay between requests (~1 req/sec)
+const CG_MAX_RETRIES  = 4;       // 0 + 3 retries
+const CG_BACKOFF_BASE = 600;     // ms; exponential backoff base
+
+// Sleep helper
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function coingeckoFetchChunk(addrsChunk) {
+  const ids = addrsChunk.map(a => a.toLowerCase()).join(',');
+  const url = `https://api.coingecko.com/api/v3/simple/token_price/polygon-pos` +
+              `?contract_addresses=${ids}&vs_currencies=usd`;
+
+  let attempt = 0;
+  // retry with exponential backoff for 429/5xx/network errors
+  // NOTE: no logic changes to your call sites; this is internal hardening
+  while (true) {
+    try {
+      const resp = await axios.get(url, { timeout: 12_000 });
+      return resp.data || {};
+    } catch (err) {
+      attempt += 1;
+      const status = err?.response?.status;
+      const retriable = status === 429 || (status >= 500 && status <= 599) || !status; // 429/5xx/network
+      if (!retriable || attempt > CG_MAX_RETRIES) {
+        console.error(`[CoinGecko] failed after ${attempt} attempt(s):`, err?.message || err);
+        return {}; // fail soft: return empty chunk
+      }
+      const backoff = CG_BACKOFF_BASE * Math.pow(2, attempt - 1); // 600, 1200, 2400, ...
+      await sleep(backoff);
+    }
+  }
+}
+
+/**
+ * Chunked + rate-limited CoinGecko price fetch.
+ * Keeps the same name/signature used by your main logic.
+ * @param {string[]} tokenAddresses - array of contract addresses
+ * @returns {Promise<Object>} map { [lowercaseAddress]: { usd: number } }
+ */
+export async function getTokenPrices(tokenAddresses) {
+  if (!tokenAddresses?.length) return {};
+
+  // Unique, lowercase, and filter obviously bad inputs
+  const uniq = Array.from(new Set(
+    tokenAddresses
+      .map(a => (a || '').toLowerCase())
+      .filter(a => /^0x[a-f0-9]{40}$/.test(a))
+  ));
+
+  // early exit if nothing valid
+  if (uniq.length === 0) return {};
+
+  // Split into safe request chunks
+  const chunks = [];
+  for (let i = 0; i < uniq.length; i += CG_CHUNK_SIZE) {
+    chunks.push(uniq.slice(i, i + CG_CHUNK_SIZE));
+  }
+
+  // Fetch sequentially with a gentle rate-limit
+  const results = {};
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    if (i > 0) await sleep(CG_RATE_MS); // simple rate limit
+    const data = await coingeckoFetchChunk(chunk);
+    // Merge (CoinGecko returns keys in lowercase)
+    for (const [addr, obj] of Object.entries(data)) {
+      if (obj && typeof obj.usd === 'number') results[addr] = { usd: obj.usd };
+    }
+    console.log(`[CoinGecko] chunk ${i + 1}/${chunks.length} → ${Object.keys(data).length} prices`);
+  }
+
+  return results;
 }
 
 async function fetchPairs(factoryAddr, abi) {
@@ -450,7 +520,7 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
   const allTokens = [...new Set(allPools.flatMap(p => [p.token0, p.token1]))];
   console.log(`Total unique tokens: ${allTokens.length}`);
 
-  // Get token prices
+  // Get token prices (CHUNKED + RATE-LIMITED; same function name)
   const prices = await getTokenPrices(allTokens);
 
   // Filter pools based on liquidity
@@ -570,12 +640,12 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
   }
 
   // 11 // Sort results by profit
-  directArbs.sort((a, b) => (b.estProfitUSD - a.estProfitUSD));
-  triArbs.sort((a, b) => (b.estProfitUSD - a.estProfitUSD));
+  const directArbsSorted = [...directArbs].sort((a, b) => (b.estProfitUSD - a.estProfitUSD));
+  const triArbsSorted    = [...triArbs].sort((a, b) => (b.estProfitUSD - a.estProfitUSD));
 
   // Save results to JSON files
-  fs.writeFileSync('direct_pool.json', JSON.stringify(directArbs, null, 2));
-  fs.writeFileSync('tri_pool.json', JSON.stringify(triArbs, null, 2));
+  fs.writeFileSync('direct_pool.json', JSON.stringify(directArbsSorted, null, 2));
+  fs.writeFileSync('tri_pool.json', JSON.stringify(triArbsSorted, null, 2));
 
-  console.log(`Saved ${directArbs.length} direct and ${triArbs.length} triangular arbs (>= $${MIN_PROFIT_USD})`);
+  console.log(`Saved ${directArbsSorted.length} direct and ${triArbsSorted.length} triangular arbs (>= $${MIN_PROFIT_USD})`);
 })();
