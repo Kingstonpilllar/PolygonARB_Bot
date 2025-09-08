@@ -1,4 +1,4 @@
-// providers.js
+// dataproviders.js
 // ESM + ethers v6
 import 'dotenv/config';
 import { JsonRpcProvider, Wallet } from 'ethers';
@@ -19,13 +19,14 @@ if (!READ_RPC_URLS.length) {
   throw new Error('READ_RPC_URLS is empty - add at least one RPC URL');
 }
 
-// helper: set polling interval if provider supports it
+// helper: set polling interval if provider supports it (ethers v6 -> pollingInterval)
 function _setProviderPolling(provider, ms) {
   if (!provider || !ms) return;
-  if (typeof provider.setPollingInterval === 'function') {
-    provider.setPollingInterval(ms);
-  } else if ('polling' in provider) {
-    try { provider.polling = ms; } catch (e) { /* ignore */ }
+  try {
+    // ethers v6: use pollingInterval
+    provider.pollingInterval = ms;
+  } catch {
+    /* ignore */
   }
 }
 
@@ -161,12 +162,12 @@ export function startWriteWatchdog(intervalMs = 3000, threshold = 3) {
 // ---------- OPTIONAL: MISMATCH GUARD ----------
 export async function verifySameChain() {
   const readNet = await _read.getNetwork();
-  if (readNet.chainId !== BigInt(CHAIN_ID)) {
+  if (readNet.chainId !== CHAIN_ID) {
     throw new Error(`Read provider chainId ${readNet.chainId} != ${CHAIN_ID}`);
   }
   if (WRITE_RPC_URLS.length) {
     const writeNet = await _ensureWrite().getNetwork();
-    if (writeNet.chainId !== BigInt(CHAIN_ID)) {
+    if (writeNet.chainId !== CHAIN_ID) {
       throw new Error(`Write provider chainId ${writeNet.chainId} != ${CHAIN_ID} (check WRITE_RPC_URLS)`);
     }
   }
