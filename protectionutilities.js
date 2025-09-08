@@ -2,7 +2,7 @@
 // To use: ensure "type": "module" in package.json
 
 import 'dotenv/config';
-import fs from 'node:fs';               // ESM-safe core import
+import fs from 'node:fs';
 import { ethers } from 'ethers';
 import { getReadProvider, readFailover } from './dataprovider.js';
 
@@ -132,7 +132,9 @@ async function meetsProfitThresholdUSD_Chainlink(provider, { profitToken, profit
       if (!feedAddr) return null;
       const c = new ethers.Contract(feedAddr, AGG_V3_ABI, provider);
       const [dec, rd] = await Promise.all([c.decimals(), c.latestRoundData()]);
-      return Number(rd[1]) / 10 ** dec;
+      // ethers v6: rd.answer is BigInt
+      const answer = typeof rd?.answer === 'bigint' ? rd.answer : (Array.isArray(rd) ? rd[1] : 0n);
+      return Number(answer) / 10 ** dec;
     }
 
     const [profitPrice, notionalPrice] = await Promise.all([
@@ -176,7 +178,7 @@ async function isFlashLoanAvailable(candidates = []) {
       `erc20.balanceOf:${token}`,
       async p => {
         const bal = await new ethers.Contract(token, ERC20_ABI, p).balanceOf(addr);
-        return bal >= BigInt(needed);
+        return bal >= (typeof needed === 'bigint' ? needed : BigInt(needed));
       },
       1500
     ).catch(() => false);
@@ -221,7 +223,7 @@ async function chooseFallbackToken(wallet, tokens, minAmt = 0n) {
 
 // 7) WALLET BALANCE
 async function hasWalletBalance(wallet, token, needed) {
-  const minRequiredWei = BigInt(needed);
+  const minRequiredWei = (typeof needed === 'bigint') ? needed : BigInt(needed);
   if (token === ethers.ZeroAddress) {
     const bal = await readCall('getBalance', p => p.getBalance(wallet), 1500).catch(() => null);
     return { ok: bal != null && bal >= minRequiredWei, balance: bal ?? 0n };
@@ -246,7 +248,10 @@ async function getV2Reserves(pair) {
     `v2.getReserves:${pair}`,
     async p => {
       const c = new ethers.Contract(pair, V2_PAIR_ABI, p);
-      const [t0, t1, [r0, r1, ts]] = await Promise.all([c.token0(), c.token1(), c.getReserves()]);
+      const [t0, t1, reserves] = await Promise.all([c.token0(), c.token1(), c.getReserves()]);
+      const r0 = reserves?.reserve0 ?? reserves?.[0];
+      const r1 = reserves?.reserve1 ?? reserves?.[1];
+      const ts = reserves?.blockTimestampLast ?? reserves?.[2];
       return { token0: t0, token1: t1, r0, r1, tsLast: Number(ts), ts: Date.now() };
     },
     2000
@@ -261,7 +266,8 @@ async function getV3State(pool) {
     async p => {
       const c = new ethers.Contract(pool, V3_POOL_ABI, p);
       const [slot0, liquidity, t0, t1] = await Promise.all([c.slot0(), c.liquidity(), c.token0(), c.token1()]);
-      return { token0: t0, token1: t1, sqrtPriceX96: slot0.sqrtPriceX96, liquidity, ts: Date.now() };
+      const sqrtPriceX96 = slot0?.sqrtPriceX96 ?? (Array.isArray(slot0) ? slot0[0] : 0n);
+      return { token0: t0, token1: t1, sqrtPriceX96, liquidity, ts: Date.now() };
     },
     2000
   ).catch(() => null);
