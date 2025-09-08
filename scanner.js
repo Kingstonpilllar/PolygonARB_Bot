@@ -1,4 +1,4 @@
-// scanner.js — Ethers v6 only (no websockets), logic preserved
+// scanner.js — Ethers v6
 
 import 'dotenv/config';
 import * as fs from 'node:fs';
@@ -308,3 +308,4 @@ function startScanner() {
 }
 
 startScanner();
+
