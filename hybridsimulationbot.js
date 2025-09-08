@@ -8,6 +8,7 @@ import sendAlert from './telegramalert.js';
 import protection from './protectionutilities.js';
 import aaveABI from './aaveABI.json';
 import balancerABI from './balancerABI.json';
+import { startBlockFeed } from './dataprovider.js'; // <-- NEW (replaces websocket listener)
 
 dotenv.config();
 console.log('[ETHERS]', ethers.version);
@@ -40,7 +41,6 @@ const BOT_INTERVAL_MS  = Number(process.env.BOT_INTERVAL_MS || '5000');
 const MAX_SLIPPAGE_BPS = Number(process.env.MAX_SLIPPAGE_BPS || '50');
 
 const RPC_URLS = (process.env.RPC_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
-const WS_URLS  = (process.env.WS_URLS  || '').split(',').map(s => s.trim()).filter(Boolean);
 
 if (!RPC_URLS.length) throw new Error('RPC_URLS is empty');
 
@@ -49,7 +49,7 @@ if (!RPC_URLS.length) throw new Error('RPC_URLS is empty');
 // ===========================================================
 const rpcProviders = RPC_URLS.map(u => new ethers.JsonRpcProvider(u, { name: 'polygon', chainId: CHAIN_ID }));
 const baseProvider = rpcProviders[0];
-
+PRIVATE_RPC_TIMEOUT_MS=5000   # per-endpoint send timeout (ms)
 const RUBIC_RPC_URL    = process.env.RUBIC_RPC_URL    || 'https://rubic-polygon.rpc.blxrbdn.com';
 const MERKLE_RPC_URL   = process.env.MERKLE_RPC_URL   || 'https://polygon.merkle.io/';
 const GETBLOCK_RPC_URL = process.env.GETBLOCK_RPC_URL || 'https://go.getblock.us/...';
@@ -62,72 +62,19 @@ function setPrivateTransactionProvider() {
 setPrivateTransactionProvider();
 
 // ===========================================================
-// 3) WebSocket provider & failover (v6-safe)
+// 3) Data provider (HTTP polling; NO WebSockets)
+//    (replaces your previous WebSocket provider & failover section)
 // ===========================================================
-function makeWsProvider(i = 0) {
-  if (!WS_URLS.length) {
-    console.warn('[WS] No WS_URLS configured; block listener disabled.');
-    return null;
-  }
-  return new ethers.WebSocketProvider(WS_URLS[i], { name: 'polygon', chainId: CHAIN_ID });
-}
-let wsIndex = 0;
-let wsProvider = makeWsProvider(wsIndex);
-let blockHandler, errorHandler;
-
-function attachWsHandlers() {
-  if (!wsProvider) return;
-
-  blockHandler = async (blockNumber) => {
-    console.log('⛓️ New block:', blockNumber);
+function listenForBlocks() {
+  // Poll every 15s for new blocks and invoke pipeline
+  return startBlockFeed(baseProvider, 15_000, async (blockNumber) => {
+    console.log('⛓️ New block (HTTP):', blockNumber);
     try {
       await processTransactions(); // Logic 1–7 + 10–15 fire within
     } catch (e) {
-      console.error('❌ processTransactions error from WS:', e.message);
+      console.error('❌ processTransactions error from HTTP feed:', e.message);
     }
-  };
-
-  errorHandler = (err) => {
-    console.warn('[WS] provider error:', err?.message || err);
-    restartWs();
-  };
-
-  wsProvider.on('block', blockHandler);
-  wsProvider.on('error', errorHandler);
-}
-
-function detachWsHandlers() {
-  if (!wsProvider) return;
-  if (blockHandler) wsProvider.off('block', blockHandler);
-  if (errorHandler) wsProvider.off('error', errorHandler);
-  blockHandler = undefined;
-  errorHandler = undefined;
-}
-
-function restartWs() {
-  if (!WS_URLS.length) return;
-  detachWsHandlers();
-  try { wsProvider?.destroy?.(); } catch (_) {}
-  wsIndex = (wsIndex + 1) % WS_URLS.length;
-  wsProvider = makeWsProvider(wsIndex);
-  console.log(`🔄 Switched WS provider to: ${WS_URLS[wsIndex]}`);
-  attachWsHandlers();
-}
-
-async function listenForBlocks() {
-  if (!wsProvider) return;
-  attachWsHandlers();
-
-  // Heartbeat to recover silent drops
-  setInterval(async () => {
-    if (!wsProvider) return;
-    try {
-      await wsProvider.getBlockNumber();
-    } catch (e) {
-      console.warn('[WS] heartbeat failed:', e.message);
-      restartWs();
-    }
-  }, 15_000);
+  });
 }
 
 // ===========================================================
@@ -369,38 +316,99 @@ async function executeWithFallback(params, pool, estProfit) {
 }
 
 // ===========================================================
-// 11) RPC send fallback (Logic 10)
 // ===========================================================
+// 11) RPC send fallback (Logic 10) — TRUE PRIVATE BROADCAST
+//     - Pre-sign once, send raw tx to Rubic → Merkle → GetBlock
+//     - Per-endpoint timeout + clean error surfacing
+// ===========================================================
+const PRIVATE_RPC_TIMEOUT_MS = Number(process.env.PRIVATE_RPC_TIMEOUT_MS || 5000);
+
 async function sendWithRpcFallback(txReq, nonce) {
-  const order = [
-    { name: 'Rubic',    url: RUBIC_RPC_URL },
-    { name: 'Merkle',   url: MERKLE_RPC_URL },
-    { name: 'GetBlock', url: GETBLOCK_RPC_URL }
-  ];
+  // Ensure chainId/nonce are set exactly as your logic expects
   txReq.chainId ??= CHAIN_ID;
   txReq.nonce   ??= nonce;
 
+  // 1) Populate fees/limits ONCE using the baseProvider tied to wallet
+  //    so the raw tx is identical no matter which private RPC we use.
+  const populated = await wallet.populateTransaction({
+    ...txReq,
+    // preserve any fee fields already present in txReq
+  });
+
+  // 2) Sign once (offline). This yields a deterministic raw transaction.
+  const signedRaw = await wallet.signTransaction(populated);
+
+  // 3) Try private relays in order with per-endpoint timeout
+  const order = [
+    { name: 'Rubic',    url: RUBIC_RPC_URL },
+    { name: 'Merkle',   url: MERKLE_RPC_URL },
+    { name: 'GetBlock', url: GETBLOCK_RPC_URL },
+  ];
+
   let lastError = null;
+
   for (const item of order) {
     try {
       const prov = new ethers.JsonRpcProvider(item.url, { name: 'polygon', chainId: CHAIN_ID });
-      const w = new ethers.Wallet(PRIVATE_KEY, prov);
-      const tx = await w.sendTransaction(txReq);
-      console.log(`🚀 Sent via ${item.name}: ${tx.hash}`);
-      return tx;
+      const txHash = await sendRawWithTimeout(prov, signedRaw, PRIVATE_RPC_TIMEOUT_MS);
+      console.log(`🚀 Sent via ${item.name}: ${txHash}`);
+      // Return a tx-like object with wait() attached for compatibility with your Logic 11–15
+      return {
+        hash: txHash,
+        wait: async (confirms = 1) => baseProvider.waitForTransaction(txHash, confirms),
+      };
     } catch (e) {
       lastError = e;
-      console.warn(`⚠️ ${item.name} send failed: ${e.message}`);
+      console.warn(`⚠️ ${item.name} send failed: ${e?.message || e}`);
     }
   }
-  throw new Error(`All RPC sends failed. Last error: ${lastError?.message ?? 'unknown'}`);
+
+  throw new Error(`All private RPC sends failed. Last error: ${lastError?.message ?? 'unknown'}`);
 }
+
+/**
+ * Low-level raw broadcast with timeout against a single provider.
+ * Uses eth_sendRawTransaction to keep it PRIVATE and identical across endpoints.
+ */
+async function sendRawWithTimeout(provider, signedRaw, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`send timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    provider
+      .send('eth_sendRawTransaction', [signedRaw])
+      .then((txHash) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(txHash);
+      })
+      .catch((err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        // Normalize a few common node errors for readability
+        const msg = String(err?.message || err);
+        if (msg.includes('already known') || msg.includes('nonce too low')) {
+          // Treat as success path: tx likely accepted by another relay
+          try {
+            const maybeHash = /0x[0-9a-fA-F]{64}/.exec(msg)?.[0];
+            if (maybeHash) return resolve(maybeHash);
+          } catch {}
+        }
+        reject(err);
+      });
+  });
+}
+
 
 // ===========================================================
 // 12) Start bot
 // ===========================================================
-console.log('[BOT] hybridSimulationBot running (Ethers v6, 15 logics intact)');
-listenForBlocks();
+console.log('[BOT] hybridSimulationBot running (Ethers v6, 15 logics intact; NO WebSockets)');
+const stopFeed = listenForBlocks(); // same function name as before; now HTTP-backed
 setInterval(processTransactions, BOT_INTERVAL_MS);
-
-
