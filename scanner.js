@@ -1,12 +1,13 @@
-// scanner.js тАФ Ethers v6 only (no v5/private fallbacks), logic preserved
+// scanner.js тАФ Ethers v6 only (no websockets), logic preserved
 
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { ethers } from 'ethers';
+import { getReadProvider, readFailover } from './dataprovider.js';
 
-/* =========================
+   1 /* =========================
    Paths & Config
 ========================= */
 const __filename = fileURLToPath(import.meta.url);
@@ -14,17 +15,9 @@ const __dirname = path.dirname(__filename);
 
 const MEV_FILE = path.join(process.cwd(), 'mev_queue.json');
 
-const WS_URLS = (process.env.WS_URLS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+// Removed WS_URLS and related warnings; we now use dataprovider.js read provider.
 
-if (!WS_URLS.length) {
-  console.warn('тЪая╕П  WS_URLS is empty; scanner will not start.');
-  // Do not exit; just no-op so other services can run.
-}
-
-/* =========================
+    2. /* =========================
    Routers & Gas threshold
 ========================= */
 let routers = {};
@@ -42,13 +35,13 @@ const ROUTER_SET = new Set(
     .map(v => v.toLowerCase())
 );
 
-// Gas threshold (GWEI) for simple MEV signal (v6 returns bigint)
+   3. // Gas threshold (GWEI) for simple MEV signal (v6 returns bigint)
 const HIGH_GAS_LIMIT = (() => {
   try { return ethers.parseUnits(String(process.env.HIGH_GAS_GWEI || '300'), 'gwei'); }
   catch { return ethers.parseUnits('300', 'gwei'); }
 })();
 
-/* =========================
+   4. /* =========================
    Retention (keep last N hours)
 ========================= */
 const SCANNER_MEV_MAX_AGE_HOURS = Number(process.env.SCANNER_MEV_MAX_AGE_HOURS || 24);
@@ -88,7 +81,7 @@ function pruneMevQueue(now = Date.now()) {
   setInterval(pruneMevQueue, 60 * 60 * 1000); // hourly
 })();
 
-/* =========================
+5  /* =========================
    ABIs & Interfaces (v6)
 ========================= */
 const V2_IFACE = new ethers.Interface([
@@ -103,7 +96,7 @@ const V3_IFACE = new ethers.Interface([
   'function multicall(bytes[] data) returns (bytes[] results)'
 ]);
 
-/* =========================
+   6 /* =========================
    Utils
 ========================= */
 function logToMevQueue(entry) {
@@ -122,7 +115,7 @@ function isRouterTarget(to) {
 }
 
 function getEffectiveGasPrice(tx) {
-  // v6: bigint or null
+   7 // v6: bigint or null
   return (tx.maxFeePerGas ?? tx.gasPrice) ?? null;
 }
 
@@ -171,7 +164,7 @@ function decodeV2Swap(data) {
 }
 
 function decodeV3Path(pathBytes) {
-  // V3 path = token(20) [fee(3) token(20)]*
+  8  // V3 path = token(20) [fee(3) token(20)]*
   const tokens = [];
   const hex = String(pathBytes).slice(2);
   let i = 0;
@@ -234,88 +227,84 @@ function decodeSwapCalldata(data) {
   return decodeV2Swap(data) || decodeV3Swap(data);
 }
 
-/* =========================
-   Scanner (pure v6 WS)
-========================= */
-function startScanner(url, index, attempt = 0) {
-  if (!url) return;
+// 9 /* =========================
+//    Scanner (provider from dataprovider.js; HTTP-only polling)
+// ========================= */
+function startScanner() {
+  let provider = getReadProvider();
+  const label = `[READ]`;
 
-  const label = `[WS ${index}]`;
-  const backoffMs = Math.min(30_000, 2000 * Math.max(1, attempt));
-  const hbIntervalMs = 15_000;
+  // 10. // Helpful connect log
+  provider.getNetwork()
+    .then(n => console.log(`${label} Connected (chainId ${n?.chainId ?? 'unknown'})`))
+    .catch(() => console.log(`${label} Connected`));
 
-  let provider;
-  try {
-    provider = new ethers.WebSocketProvider(url);
-  } catch (e) {
-    console.warn(`${label} Provider init failed: ${e.message}. Retrying in ${backoffMs} ms`);
-    return setTimeout(() => startScanner(url, index, attempt + 1), backoffMs);
-  }
+  // 11  // Block poller: fetch latest block with transactions and scan them
+  let lastProcessed = 0n;
+  const pollIntervalMs = 1500;
 
-  // Helpful connect log (chainId may require an RPC call)
-  provider.getNetwork().then(n => {
-    console.log(`${label} Connected: ${url} (chainId ${n?.chainId ?? 'unknown'})`);
-  }).catch(() => console.log(`${label} Connected: ${url}`));
-
-  // Pending tx stream
-  provider.on('pending', async (txHash) => {
+  async function scanLatestBlock() {
     try {
-      const tx = await provider.getTransaction(txHash);
-      if (!tx) return;
+      const p = getReadProvider(); // always fetch current (in case we rotated)
+      const bn = await p.getBlockNumber();
+      if (lastProcessed && bn <= lastProcessed) return;
 
-      const effGas = getEffectiveGasPrice(tx); // bigint or null
-      const gasIsHigh = effGas ? (effGas > HIGH_GAS_LIMIT) : false;
-      const hitsRouter = isRouterTarget(tx.to);
+      const block = await p.getBlockWithTransactions(bn);
+      if (!block || !Array.isArray(block.transactions)) return;
 
-      let decoded = null;
-      if (hitsRouter || gasIsHigh) {
-        if (tx.data && tx.data !== '0x') {
-          decoded = decodeSwapCalldata(tx.data);
+      for (const tx of block.transactions) {
+        // original logic preserved
+        const effGas = getEffectiveGasPrice(tx); // bigint or null
+        const gasIsHigh = effGas ? (effGas > HIGH_GAS_LIMIT) : false;
+        const hitsRouter = isRouterTarget(tx.to);
+
+        let decoded = null;
+        if (hitsRouter || gasIsHigh) {
+          if (tx.data && tx.data !== '0x') {
+            decoded = decodeSwapCalldata(tx.data);
+          }
+        }
+
+        if (gasIsHigh || hitsRouter || decoded) {
+          const entry = {
+            hash: tx.hash,
+            from: tx.from,
+            to: tx.to,
+            gasPrice: effGas ? effGas.toString() : null,
+            timestamp: Date.now()
+          };
+          if (decoded) entry.decoded = decoded;
+          if (tx.value) entry.txValue = tx.value.toString();
+          logToMevQueue(entry);
         }
       }
 
-      if (gasIsHigh || hitsRouter || decoded) {
-        const entry = {
-          hash: tx.hash,
-          from: tx.from,
-          to: tx.to,
-          gasPrice: effGas ? effGas.toString() : null,
-          timestamp: Date.now()
-        };
-        if (decoded) entry.decoded = decoded;
-        if (tx.value) entry.txValue = tx.value.toString();
-        logToMevQueue(entry);
-      }
-    } catch {
-      // keep stream alive
+      lastProcessed = BigInt(bn);
+    } catch (err) {
+      // swallow; heartbeat below will trigger failover if needed
     }
-  });
+  }
 
-  // Public error event тЖТ reconnect
-  const onError = (err) => {
-    console.warn(`${label} Provider error: ${err?.message || err}. Reconnecting in ${backoffMs} ms...`);
-    cleanupAndRetry();
+  const poller = setInterval(scanLatestBlock, pollIntervalMs);
+  console.log(`${label} Polling latest blocks every ${pollIntervalMs}msтАж`);
+
+  // 12 // Error handling тАФ rotate read RPC and continue polling
+  const onError = async (err) => {
+    console.warn(`${label} Provider error: ${err?.message || err}. Rotating read RPCтАж`);
+    await readFailover();
+    provider = getReadProvider();
   };
   provider.on('error', onError);
 
-  // Heartbeat to detect silent drops (no private ws access)
+  // 13  // Heartbeat to detect silent drops (rotate via dataprovider on failure)
+  const hbIntervalMs = 15000;
   const hb = setInterval(async () => {
-    try { await provider.getBlockNumber(); }
+    try { await getReadProvider().getBlockNumber(); }
     catch {
-      console.warn(`${label} Heartbeat failed. Reconnecting in ${backoffMs} ms...`);
-      cleanupAndRetry();
+      console.warn(`${label} Heartbeat failed. Rotating read RPCтАж`);
+      await readFailover();
     }
   }, hbIntervalMs);
-
-  function cleanupAndRetry() {
-    try {
-      provider.off('error', onError);
-      provider.removeAllListeners?.('pending'); // be tidy
-      clearInterval(hb);
-      provider.destroy?.(); // v6 WebSocketProvider has destroy()
-    } catch {}
-    setTimeout(() => startScanner(url, index, attempt + 1), backoffMs);
-  }
 }
 
-WS_URLS.forEach((url, i) => startScanner(url, i));
+startScanner();
