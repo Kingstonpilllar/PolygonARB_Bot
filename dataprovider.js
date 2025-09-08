@@ -4,7 +4,7 @@ import { ethers } from 'ethers';
 
 // ---------- CONSTANTS ----------
 const CHAIN_ID = 137; // Polygon mainnet
-const NETWORKish = { chainId: CHAIN_ID, name: 'polygon' };
+const NETWORK = { chainId: CHAIN_ID, name: 'polygon' };
 
 // ---------- READ-ONLY (HARDCODED) ----------
 const READ_RPC_URLS = [
@@ -16,29 +16,31 @@ const READ_RPC_URLS = [
 ];
 
 let _rIdx = 0;
-let _read = new ethers.JsonRpcProvider(READ_RPC_URLS[_rIdx], NETWORKish);
+let _read = new ethers.JsonRpcProvider(READ_RPC_URLS[_rIdx], NETWORK);
 _read.pollingInterval = 1500;
 
 // subscribe registry so listeners can be reattached on failover
 const _subs = []; // { kind: 'block'|'log', handler, filter? }
 
+// keep original call order: attach first, then record
 export function addBlockListener(handler) {
-  _read.on?.('block', handler);
+  _read.on('block', handler);
   _subs.push({ kind: 'block', handler });
 }
 export function addLogListener(filter, handler) {
-  _read.on?.(filter, handler);
+  _read.on(filter, handler);
   _subs.push({ kind: 'log', filter, handler });
 }
 
 function _rotateRead() {
   _rIdx = (_rIdx + 1) % READ_RPC_URLS.length;
-  _read = new ethers.JsonRpcProvider(READ_RPC_URLS[_rIdx], NETWORKish);
+  _read = new ethers.JsonRpcProvider(READ_RPC_URLS[_rIdx], NETWORK);
   _read.pollingInterval = 1500;
-  // reattach listeners
+
+  // reattach listeners in the same order they were added originally
   for (const s of _subs) {
-    if (s.kind === 'block') _read.on?.('block', s.handler);
-    else _read.on?.(s.filter, s.handler);
+    if (s.kind === 'block') _read.on('block', s.handler);
+    else _read.on(s.filter, s.handler);
   }
   return _read;
 }
@@ -48,7 +50,7 @@ export function getReadProvider() {
 }
 
 export async function readFailover() {
-  console.warn('♻️ READ failover rotating RPC…');
+  console.warn('READ failover rotating RPC…');
   return _rotateRead();
 }
 
@@ -75,7 +77,7 @@ let _write = null;
 function _ensureWrite() {
   if (!_write) {
     if (!WRITE_RPC_URL) throw new Error('Missing WRITE_RPC_URL (or RPC_URL) in .env');
-    _write = new ethers.JsonRpcProvider(WRITE_RPC_URL, NETWORKish);
+    _write = new ethers.JsonRpcProvider(WRITE_RPC_URL, NETWORK);
     _write.pollingInterval = 1500;
   }
   return _write;
