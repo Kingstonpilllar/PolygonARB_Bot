@@ -4,9 +4,8 @@ import { ethers } from 'ethers';
 
 // ---------- CONSTANTS ----------
 const CHAIN_ID = 137; // Polygon mainnet
-const NETWORK = { chainId: CHAIN_ID, name: 'polygon' };
 
-// ---------- READ-ONLY (HARDCODED) ----------
+// ---------- HARDCODED READ RPCs ----------
 const READ_RPC_URLS = [
   'https://polygon-mainnet.g.alchemy.com/v2/C3-3l0i9jKmV2y_07pPCd',
   'https://polygon-bor-rpc.publicnode.com',
@@ -15,14 +14,13 @@ const READ_RPC_URLS = [
   'https://matic-mainnet.chainstacklabs.com'
 ];
 
-let _rIdx = 0;
-let _read = new ethers.JsonRpcProvider(READ_RPC_URLS[_rIdx], NETWORK);
-_read.pollingInterval = 1500;
+// start from a random read RPC
+let _rIdx = Math.floor(Math.random() * READ_RPC_URLS.length);
+let _read = new ethers.JsonRpcProvider(READ_RPC_URLS[_rIdx], CHAIN_ID);
+_read.setPollingInterval(1500);
 
-// subscribe registry so listeners can be reattached on failover
 const _subs = []; // { kind: 'block'|'log', handler, filter? }
 
-// keep original call order: attach first, then record
 export function addBlockListener(handler) {
   _read.on('block', handler);
   _subs.push({ kind: 'block', handler });
@@ -34,10 +32,9 @@ export function addLogListener(filter, handler) {
 
 function _rotateRead() {
   _rIdx = (_rIdx + 1) % READ_RPC_URLS.length;
-  _read = new ethers.JsonRpcProvider(READ_RPC_URLS[_rIdx], NETWORK);
-  _read.pollingInterval = 1500;
+  _read = new ethers.JsonRpcProvider(READ_RPC_URLS[_rIdx], CHAIN_ID);
+  _read.setPollingInterval(1500);
 
-  // reattach listeners in the same order they were added originally
   for (const s of _subs) {
     if (s.kind === 'block') _read.on('block', s.handler);
     else _read.on(s.filter, s.handler);
@@ -62,6 +59,7 @@ export function startReadWatchdog(intervalMs = 1500, threshold = 3) {
       fails = 0;
     } catch {
       if (++fails >= threshold) {
+        console.warn('Watchdog rotating READ provider after repeated failures');
         fails = 0;
         _rotateRead();
       }
@@ -69,17 +67,34 @@ export function startReadWatchdog(intervalMs = 1500, threshold = 3) {
   }, intervalMs);
 }
 
-// ---------- WRITE (TX) VIA .env ONLY ----------
-const WRITE_RPC_URL = process.env.WRITE_RPC_URL || process.env.RPC_URL || null;
+// ---------- HARDCODED WRITE RPCs ----------
+const WRITE_RPC_URLS = [
+  'https://polygon-rpc.com',
+  'https://polygon-bor-rpc.publicnode.com'
+];
+
 const PRIVATE_KEY = (process.env.PRIVATE_KEY || '').trim() || null;
 
+// start from a random write RPC
+let _wIdx = Math.floor(Math.random() * WRITE_RPC_URLS.length);
 let _write = null;
+
+function _makeWriteProvider() {
+  const url = WRITE_RPC_URLS[_wIdx];
+  console.log(`Using WRITE RPC: ${url}`);
+  const provider = new ethers.JsonRpcProvider(url, CHAIN_ID);
+  provider.setPollingInterval(1500);
+  return provider;
+}
+
 function _ensureWrite() {
-  if (!_write) {
-    if (!WRITE_RPC_URL) throw new Error('Missing WRITE_RPC_URL (or RPC_URL) in .env');
-    _write = new ethers.JsonRpcProvider(WRITE_RPC_URL, NETWORK);
-    _write.pollingInterval = 1500;
-  }
+  if (!_write) _write = _makeWriteProvider();
+  return _write;
+}
+
+function _rotateWrite() {
+  _wIdx = (_wIdx + 1) % WRITE_RPC_URLS.length;
+  _write = _makeWriteProvider();
   return _write;
 }
 
@@ -92,20 +107,37 @@ export function getSigner() {
   return new ethers.Wallet(PRIVATE_KEY, _ensureWrite());
 }
 
+export async function writeFailover() {
+  console.warn('WRITE failover rotating RPC…');
+  return _rotateWrite();
+}
+
+export function startWriteWatchdog(intervalMs = 3000, threshold = 3) {
+  let fails = 0;
+  setInterval(async () => {
+    try {
+      await _ensureWrite().getBlockNumber();
+      fails = 0;
+    } catch {
+      if (++fails >= threshold) {
+        console.warn('Watchdog rotating WRITE provider after repeated failures');
+        fails = 0;
+        _rotateWrite();
+      }
+    }
+  }, intervalMs);
+}
+
 // ---------- OPTIONAL: MISMATCH GUARD ----------
-/**
- * Ensures both read and write providers (if write configured) are on Polygon (137).
- * Throws if mismatch is detected.
- */
 export async function verifySameChain() {
   const readNet = await _read.getNetwork();
   if (readNet.chainId !== BigInt(CHAIN_ID)) {
     throw new Error(`Read provider chainId ${readNet.chainId} != ${CHAIN_ID}`);
   }
-  if (WRITE_RPC_URL) {
+  if (WRITE_RPC_URLS.length) {
     const writeNet = await _ensureWrite().getNetwork();
     if (writeNet.chainId !== BigInt(CHAIN_ID)) {
-      throw new Error(`Write provider chainId ${writeNet.chainId} != ${CHAIN_ID} (check WRITE_RPC_URL)`);
+      throw new Error(`Write provider chainId ${writeNet.chainId} != ${CHAIN_ID} (check WRITE_RPC_URLS)`);
     }
   }
 }
