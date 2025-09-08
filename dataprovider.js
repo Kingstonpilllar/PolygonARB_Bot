@@ -1,6 +1,7 @@
+// providers.js
 // ESM + ethers v6
 import 'dotenv/config';
-import { ethers } from 'ethers';
+import { JsonRpcProvider, Wallet } from 'ethers';
 
 // ---------- CONSTANTS ----------
 const CHAIN_ID = 137; // Polygon mainnet
@@ -14,17 +15,34 @@ const READ_RPC_URLS = [
   'https://matic-mainnet.chainstacklabs.com'
 ];
 
-// start from a random read RPC
-let _rIdx = Math.floor(Math.random() * READ_RPC_URLS.length);
-let _read = new ethers.JsonRpcProvider(READ_RPC_URLS[_rIdx], CHAIN_ID);
-_read.setPollingInterval(1500);
+if (!READ_RPC_URLS.length) {
+  throw new Error('READ_RPC_URLS is empty - add at least one RPC URL');
+}
 
+// helper: set polling interval if provider supports it
+function _setProviderPolling(provider, ms) {
+  if (!provider || !ms) return;
+  if (typeof provider.setPollingInterval === 'function') {
+    provider.setPollingInterval(ms);
+  } else if ('polling' in provider) {
+    try { provider.polling = ms; } catch (e) { /* ignore */ }
+  }
+}
+
+// start from a random read RPC index
+let _rIdx = Math.floor(Math.random() * READ_RPC_URLS.length);
+let _read = new JsonRpcProvider(READ_RPC_URLS[_rIdx], CHAIN_ID);
+_setProviderPolling(_read, 1500);
+
+// subscribe registry so listeners can be reattached on failover
 const _subs = []; // { kind: 'block'|'log', handler, filter? }
 
+// keep original call order: attach first, then record
 export function addBlockListener(handler) {
   _read.on('block', handler);
   _subs.push({ kind: 'block', handler });
 }
+
 export function addLogListener(filter, handler) {
   _read.on(filter, handler);
   _subs.push({ kind: 'log', filter, handler });
@@ -32,12 +50,16 @@ export function addLogListener(filter, handler) {
 
 function _rotateRead() {
   _rIdx = (_rIdx + 1) % READ_RPC_URLS.length;
-  _read = new ethers.JsonRpcProvider(READ_RPC_URLS[_rIdx], CHAIN_ID);
-  _read.setPollingInterval(1500);
+  _read = new JsonRpcProvider(READ_RPC_URLS[_rIdx], CHAIN_ID);
+  _setProviderPolling(_read, 1500);
 
+  // reattach listeners in the same order they were added originally
   for (const s of _subs) {
-    if (s.kind === 'block') _read.on('block', s.handler);
-    else _read.on(s.filter, s.handler);
+    if (s.kind === 'block') {
+      _read.on('block', s.handler);
+    } else {
+      _read.on(s.filter, s.handler);
+    }
   }
   return _read;
 }
@@ -57,7 +79,7 @@ export function startReadWatchdog(intervalMs = 1500, threshold = 3) {
     try {
       await _read.getBlockNumber();
       fails = 0;
-    } catch {
+    } catch (err) {
       if (++fails >= threshold) {
         console.warn('Watchdog rotating READ provider after repeated failures');
         fails = 0;
@@ -75,15 +97,16 @@ const WRITE_RPC_URLS = [
 
 const PRIVATE_KEY = (process.env.PRIVATE_KEY || '').trim() || null;
 
-// start from a random write RPC
-let _wIdx = Math.floor(Math.random() * WRITE_RPC_URLS.length);
+let _wIdx = WRITE_RPC_URLS.length ? Math.floor(Math.random() * WRITE_RPC_URLS.length) : 0;
 let _write = null;
 
 function _makeWriteProvider() {
+  if (!WRITE_RPC_URLS.length) {
+    throw new Error('WRITE_RPC_URLS is empty - add at least one write RPC URL');
+  }
   const url = WRITE_RPC_URLS[_wIdx];
-  console.log(`Using WRITE RPC: ${url}`);
-  const provider = new ethers.JsonRpcProvider(url, CHAIN_ID);
-  provider.setPollingInterval(1500);
+  const provider = new JsonRpcProvider(url, CHAIN_ID);
+  _setProviderPolling(provider, 1500);
   return provider;
 }
 
@@ -93,6 +116,9 @@ function _ensureWrite() {
 }
 
 function _rotateWrite() {
+  if (!WRITE_RPC_URLS.length) {
+    throw new Error('No WRITE RPCs to rotate');
+  }
   _wIdx = (_wIdx + 1) % WRITE_RPC_URLS.length;
   _write = _makeWriteProvider();
   return _write;
@@ -104,7 +130,7 @@ export function getWriteProvider() {
 
 export function getSigner() {
   if (!PRIVATE_KEY) throw new Error('Missing PRIVATE_KEY in .env');
-  return new ethers.Wallet(PRIVATE_KEY, _ensureWrite());
+  return new Wallet(PRIVATE_KEY, _ensureWrite());
 }
 
 export async function writeFailover() {
@@ -113,12 +139,16 @@ export async function writeFailover() {
 }
 
 export function startWriteWatchdog(intervalMs = 3000, threshold = 3) {
+  if (!WRITE_RPC_URLS.length) {
+    console.warn('No WRITE RPCs configured; write watchdog disabled');
+    return;
+  }
   let fails = 0;
   setInterval(async () => {
     try {
       await _ensureWrite().getBlockNumber();
       fails = 0;
-    } catch {
+    } catch (err) {
       if (++fails >= threshold) {
         console.warn('Watchdog rotating WRITE provider after repeated failures');
         fails = 0;
