@@ -1,4 +1,3 @@
-// dataproviders.js
 // ESM + ethers v6
 import 'dotenv/config';
 import { JsonRpcProvider, Wallet } from 'ethers';
