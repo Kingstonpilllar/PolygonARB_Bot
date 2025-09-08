@@ -1,4 +1,4 @@
-// hybridsimulationbot.js — Ethers v6, 15 logics intact
+// hybridsimulationbot.js — Ethers v6, 15 logics intact (NO WebSockets)
 
 import fs from 'fs';
 import path from 'path';
@@ -8,7 +8,7 @@ import sendAlert from './telegramalert.js';
 import protection from './protectionutilities.js';
 import aaveABI from './aaveABI.json';
 import balancerABI from './balancerABI.json';
-import { startBlockFeed } from './dataprovider.js'; // <-- NEW (replaces websocket listener)
+import { startBlockFeed } from './dataprovider.js'; // NEW (replaces websocket listener)
 
 dotenv.config();
 console.log('[ETHERS]', ethers.version);
@@ -40,7 +40,10 @@ const PROFIT_USD       = Number(process.env.PROFIT_THRESHOLD_USD || '40');
 const BOT_INTERVAL_MS  = Number(process.env.BOT_INTERVAL_MS || '5000');
 const MAX_SLIPPAGE_BPS = Number(process.env.MAX_SLIPPAGE_BPS || '50');
 
-const RPC_URLS = (process.env.RPC_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
+const RPC_URLS = (process.env.RPC_URLS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 if (!RPC_URLS.length) throw new Error('RPC_URLS is empty');
 
@@ -49,7 +52,7 @@ if (!RPC_URLS.length) throw new Error('RPC_URLS is empty');
 // ===========================================================
 const rpcProviders = RPC_URLS.map(u => new ethers.JsonRpcProvider(u, { name: 'polygon', chainId: CHAIN_ID }));
 const baseProvider = rpcProviders[0];
-PRIVATE_RPC_TIMEOUT_MS=5000   # per-endpoint send timeout (ms)
+
 const RUBIC_RPC_URL    = process.env.RUBIC_RPC_URL    || 'https://rubic-polygon.rpc.blxrbdn.com';
 const MERKLE_RPC_URL   = process.env.MERKLE_RPC_URL   || 'https://polygon.merkle.io/';
 const GETBLOCK_RPC_URL = process.env.GETBLOCK_RPC_URL || 'https://go.getblock.us/...';
@@ -63,7 +66,6 @@ setPrivateTransactionProvider();
 
 // ===========================================================
 // 3) Data provider (HTTP polling; NO WebSockets)
-//    (replaces your previous WebSocket provider & failover section)
 // ===========================================================
 function listenForBlocks() {
   // Poll every 15s for new blocks and invoke pipeline
@@ -255,7 +257,7 @@ async function executeWithFallback(params, pool, estProfit) {
       const gasPrice   = feeData.gasPrice ?? 0n;
       const gasCostWei = BigInt(gasLimit) * gasPrice;
       const gasEth     = Number(ethers.formatUnits(gasCostWei, 18));
-      const priceUsd   = Number(process.env.ETH_PRICE_USD || '2500');
+      const priceUsd   = Number(process.env.ETH_PRICE_USD || '2500'); // keep existing logic
       const gasCostUsd = gasEth * priceUsd;
       console.log(`⛽ Gas: ${gasLimit} | Cost ≈ $${gasCostUsd.toFixed(2)} | Profit ≈ $${profitEst.toFixed(2)}`);
       return gasCostUsd > profitEst;
@@ -316,10 +318,7 @@ async function executeWithFallback(params, pool, estProfit) {
 }
 
 // ===========================================================
-// ===========================================================
 // 11) RPC send fallback (Logic 10) — TRUE PRIVATE BROADCAST
-//     - Pre-sign once, send raw tx to Rubic → Merkle → GetBlock
-//     - Per-endpoint timeout + clean error surfacing
 // ===========================================================
 const PRIVATE_RPC_TIMEOUT_MS = Number(process.env.PRIVATE_RPC_TIMEOUT_MS || 5000);
 
@@ -329,13 +328,12 @@ async function sendWithRpcFallback(txReq, nonce) {
   txReq.nonce   ??= nonce;
 
   // 1) Populate fees/limits ONCE using the baseProvider tied to wallet
-  //    so the raw tx is identical no matter which private RPC we use.
   const populated = await wallet.populateTransaction({
     ...txReq,
     // preserve any fee fields already present in txReq
   });
 
-  // 2) Sign once (offline). This yields a deterministic raw transaction.
+  // 2) Sign once (offline). Deterministic raw transaction.
   const signedRaw = await wallet.signTransaction(populated);
 
   // 3) Try private relays in order with per-endpoint timeout
@@ -352,7 +350,7 @@ async function sendWithRpcFallback(txReq, nonce) {
       const prov = new ethers.JsonRpcProvider(item.url, { name: 'polygon', chainId: CHAIN_ID });
       const txHash = await sendRawWithTimeout(prov, signedRaw, PRIVATE_RPC_TIMEOUT_MS);
       console.log(`🚀 Sent via ${item.name}: ${txHash}`);
-      // Return a tx-like object with wait() attached for compatibility with your Logic 11–15
+      // Return a tx-like object with wait() for Logic 11–15 compatibility
       return {
         hash: txHash,
         wait: async (confirms = 1) => baseProvider.waitForTransaction(txHash, confirms),
@@ -391,10 +389,8 @@ async function sendRawWithTimeout(provider, signedRaw, timeoutMs) {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        // Normalize a few common node errors for readability
         const msg = String(err?.message || err);
         if (msg.includes('already known') || msg.includes('nonce too low')) {
-          // Treat as success path: tx likely accepted by another relay
           try {
             const maybeHash = /0x[0-9a-fA-F]{64}/.exec(msg)?.[0];
             if (maybeHash) return resolve(maybeHash);
@@ -405,10 +401,9 @@ async function sendRawWithTimeout(provider, signedRaw, timeoutMs) {
   });
 }
 
-
 // ===========================================================
 // 12) Start bot
 // ===========================================================
 console.log('[BOT] hybridSimulationBot running (Ethers v6, 15 logics intact; NO WebSockets)');
-const stopFeed = listenForBlocks(); // same function name as before; now HTTP-backed
+const stopFeed = listenForBlocks(); // HTTP-backed block feed
 setInterval(processTransactions, BOT_INTERVAL_MS);
