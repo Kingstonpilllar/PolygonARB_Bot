@@ -2,7 +2,6 @@
 // Dependencies: npm install ethers axios
 // (fs, path, child_process are built-in)
 
-import 'dotenv/config';
 import { ethers } from 'ethers';
 import axios from 'axios';
 import fs from 'node:fs';
@@ -13,180 +12,124 @@ import dexConfig from './dexconfig.json' assert { type: 'json' };
 import { FACTORIES } from './factories.js';
 import factoryABIs from './factory_ABI.js'; // assumed export of ABIs
 
-// === CONFIG (Polygon-only) ===
-const WSS_URLS = process.env.WSS_URLS
-  ? process.env.WSS_URLS.split(',').map(s => s.trim())
-  : [];
+// 1// === CONFIG (Polygon-only, HTTP RPC failover; NO .env, NO WebSocket) ===
+const RPC_URLS = [
+  'https://polygon-mainnet.g.alchemy.com/v2/C3-3l0i9jKmV2y_07pPCd',
+  'https://polygon-bor-rpc.publicnode.com',
+  'https://polygon-rpc.com',
+  'https://rpc-mainnet.matic.network',
+  'https://matic-mainnet.chainstacklabs.com'
+];
 
-if (WSS_URLS.length === 0) {
-  throw new Error('❌ No WSS_URLS found in .env (example: WSS_URLS=wss://alchemy...,wss://quiknode...)');
+if (RPC_URLS.length === 0) {
+  throw new Error('❌ No RPC URLs configured.');
 }
 
 let provider;
 let currentIndex = 0;
 
-/** -----------------------------------------------------------------
- *  v6-safe helpers for WebSocket events (no logic changes)
- *  - Prefer public provider events when available
- *  - Still support private _websocket if present (best-effort)
- * ----------------------------------------------------------------*/
-function wsAddListener(ws, event, handler) {
-  if (!ws) return;
-  if (typeof ws.addEventListener === 'function') ws.addEventListener(event, handler);
-  else if (typeof ws.on === 'function') ws.on(event, handler);
-  else ws[`on${event}`] = handler;
+// Keep a registry of active subscriptions so we can re-attach after failover
+const ACTIVE_SUBSCRIPTIONS = []; // { kind: 'block'|'log', handler, filter? }
+
+function addBlockListener(handler) {
+  provider.on('block', handler);
+  ACTIVE_SUBSCRIPTIONS.push({ kind: 'block', handler });
+}
+function addLogListener(filter, handler) {
+  provider.on(filter, handler);
+  ACTIVE_SUBSCRIPTIONS.push({ kind: 'log', filter, handler });
 }
 
-function wsRemoveListener(ws, event, handler) {
-  if (!ws) return;
-  if (typeof ws.removeEventListener === 'function') ws.removeEventListener(event, handler);
-  else if (typeof ws.off === 'function') ws.off(event, handler);
-  else if (ws[`on${event}`] === handler) ws[`on${event}`] = null;
-}
-
-/**
- * Connect to WebSocket provider with failover support
- * (Logic preserved; uses v6 public 'error' + optional private handle if present)
- */
 async function connectProvider() {
-  const url = WSS_URLS[currentIndex];
-  console.log(`🔌 Connecting WebSocket provider: ${url}`);
-
-  // v6-compatible constructor
-  provider = new ethers.WebSocketProvider(url);
-
-  // Public error surface (v6)
-  const onProvError = (err) => {
-    console.error(`❌ WebSocket provider error on ${url}:`, err?.message || err);
-    failover();
-  };
-  provider.on('error', onProvError);
-
-  // If the underlying ws is exposed, wire open/error/close like your original
-  const ws = provider._websocket || provider._ws || provider._socket || null;
-
-  if (ws) {
-    const onOpen = () => console.log(`✅ WebSocket connected: ${url}`);
-    const onErr  = (err) => {
-      console.error(`❌ WebSocket error on ${url}:`, err?.message || err);
-      failover();
-    };
-    const onClose = () => {
-      console.warn(`⚠️ WebSocket closed: ${url}`);
-      failover();
-    };
-
-    wsAddListener(ws, 'open', onOpen);
-    wsAddListener(ws, 'error', onErr);
-    wsAddListener(ws, 'close', onClose);
-
-    // Keep references so GC won’t drop them (optional)
-    provider.__wsHandlers = { onOpen, onErr, onClose, onProvError, wsRef: ws };
-  } else {
-    // Fallback: we can’t get the raw socket; rely on provider events + a small heartbeat
-    provider.__wsHandlers = { onProvError, wsRef: null };
-  }
-
+  const url = RPC_URLS[currentIndex];
+  console.log(`🔌 Connecting HTTP RPC provider: ${url}`);
+  provider = new ethers.JsonRpcProvider(url);
+  provider.pollingInterval = 1500; // snappy polls
   return provider;
 }
 
-/**
- * Failover logic for WebSocket provider
- */
-function failover() {
-  try {
-    // best-effort cleanup (v6 has destroy())
-    provider?.off?.('error', provider?.__wsHandlers?.onProvError);
-    if (provider?.destroy) { try { provider.destroy(); } catch (_) {} }
-    const ws = provider?.__wsHandlers?.wsRef;
-    if (ws && provider?.__wsHandlers) {
-      wsRemoveListener(ws, 'open',  provider.__wsHandlers.onOpen);
-      wsRemoveListener(ws, 'error', provider.__wsHandlers.onErr);
-      wsRemoveListener(ws, 'close', provider.__wsHandlers.onClose);
+async function waitForOpen(rpcProvider, timeoutMs = 12000) {
+  const start = Date.now();
+  let lastErr;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await rpcProvider.getBlockNumber();
+      return;
+    } catch (e) {
+      lastErr = e;
+      await new Promise(r => setTimeout(r, 400));
     }
-  } catch (_) {}
-
-  console.log('♻️ Switching provider...');
-  currentIndex = (currentIndex + 1) % WSS_URLS.length; // Rotate to next WSS URL
-  connectProvider().then(startListeners).catch((e) => {
-    console.error('Failover connect error:', e?.message || e);
-    // try next
-    setTimeout(failover, 1000);
-  });
+  }
+  throw new Error(`RPC open timeout: ${lastErr?.message || lastErr}`);
 }
 
-/**
- * --- WebSocket readiness helpers (no logic changes elsewhere) ---
- * v6-safe: prefer provider.getBlockNumber as a heartbeat when private socket is unavailable
- */
-function waitForOpen(wsProvider, timeoutMs = 12000) {
-  return new Promise((resolve, reject) => {
-    const ws = wsProvider?._websocket || wsProvider?._ws || wsProvider?._socket || null;
+function nextIndex() {
+  currentIndex = (currentIndex + 1) % RPC_URLS.length;
+}
 
-    // If socket is already open
-    if (ws && typeof ws.readyState === 'number' && ws.readyState === 1) {
-      return resolve();
-    }
+async function recoverAndResubscribe() {
+  console.warn('♻️ Recovering: switching RPC and re-subscribing listeners…');
+  nextIndex();
+  await connectProvider();
+  await waitForOpen(provider);
 
-    let done = false;
-    const finish = (err) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      clearInterval(pollTimer);
-      if (err) reject(err); else resolve();
-    };
-
-    // v6-safe active poll (works even when private ws is not exposed)
-    const pollInterval = 750;
-    const pollTimer = setInterval(async () => {
-      try {
-        await wsProvider.getBlockNumber();
-        finish();
-      } catch (_) {}
-    }, pollInterval);
-
-    // Private handle path (keep original behavior if present)
-    const onOpen = () => finish();
-    const onError = (err) => finish(err instanceof Error ? err : new Error(String(err)));
-
-    if (ws) {
-      wsAddListener(ws, 'open', onOpen);
-      wsAddListener(ws, 'error', onError);
-    } else {
-      // As a fallback, resolve on first block (same net effect)
-      wsProvider.once?.('block', () => finish());
-      wsProvider.on?.('error', onError);
-    }
-
-    const timer = setTimeout(() => {
-      finish(new Error('WebSocket open timeout'));
-    }, timeoutMs);
-  });
+  // Re-attach all known listeners to the new provider
+  for (const sub of ACTIVE_SUBSCRIPTIONS) {
+    if (sub.kind === 'block') provider.on('block', sub.handler);
+    else provider.on(sub.filter, sub.handler);
+  }
+  console.log('🔁 Re-subscribed all listeners on new RPC.');
 }
 
 async function ready() {
   if (!provider) await connectProvider();
-  await waitForOpen(provider);
+  try {
+    await waitForOpen(provider);
+  } catch (e) {
+    console.error('❌ Provider heartbeat failed:', e?.message || e);
+    await recoverAndResubscribe();
+  }
+}
+
+// Alias to keep your original call sites intact (used in §7)
+async function failover() {
+  await recoverAndResubscribe();
+}
+
+// Optional: lightweight watchdog that triggers recovery on repeated RPC errors
+function startWatchdog() {
+  let consecutive = 0;
+  setInterval(async () => {
+    try {
+      await provider.getBlockNumber();
+      consecutive = 0;
+    } catch (_) {
+      consecutive += 1;
+      if (consecutive >= 3) {
+        consecutive = 0;
+        await recoverAndResubscribe();
+      }
+    }
+  }, 1500);
 }
 
 function startListeners() {
-  // Example: listen to new blocks (unchanged)
-  provider.on('block', (blockNumber) => {
+  // previously: provider.on('block', ...)
+  addBlockListener((blockNumber) => {
     console.log('⛓️ New block:', blockNumber);
-    // ⚡ Add your pool fetch logic here
   });
 }
 
-// Start WebSocket connection and listeners
+// Start connection and listeners
 async function start() {
   await connectProvider();
-  await waitForOpen(provider);  // ensure WS is actually open (unchanged)
+  await waitForOpen(provider);
   startListeners();
+  startWatchdog();
 }
 start();
 
-// === PROFIT ESTIMATION HELPERS ===
+// 2 // === PROFIT ESTIMATION HELPERS ===
 const DEX_FEE_BPS = {
   'QuickSwap': 30,
   'QuickSwap V2': 30,
@@ -202,10 +145,11 @@ const DEX_FEE_BPS = {
 
 const DEFAULT_FEE_BPS = 30;
 const MIN_LIQUIDITY_USD = 50000;
-const ARB_THRESHOLD = 0.01; // 1% (still available for edge gating if you want)
+const ARB_THRESHOLD = 0.01; // 1%
 
-const NOTIONAL_USD = Number(process.env.POOLFETCHER_NOTIONAL_USD || 10000);
-const MIN_PROFIT_USD = Number(process.env.POOLFETCHER_MIN_PROFIT_USD || 40);
+// ❌ removed .env; hard-coded defaults preserved
+const NOTIONAL_USD = 10000;
+const MIN_PROFIT_USD = 40;
 
 function feeBpsForDex(name) {
   return DEX_FEE_BPS[name] ?? DEFAULT_FEE_BPS;
@@ -234,7 +178,7 @@ function edgeToProfitUSD(edgeFrac, notionalUSD = NOTIONAL_USD) {
   return e > 0 ? e * notionalUSD : 0;
 }
 
-// === HELPERS ===
+// 3 // === HELPERS ===
 async function getTokenPrices(tokenAddresses) {
   if (!tokenAddresses.length) return {};
   const ids = tokenAddresses.map(addr => addr.toLowerCase()).join(',');
@@ -286,14 +230,11 @@ function calcPrice(reserve0, reserve1) {
   return (r0 > 0 && r1 > 0) ? (r0 / r1) : 0;
 }
 
-/** -----------------------------------------------------------------------
- *  SWAP EVENT WATCH (Uniswap V2-style)
- *  - On each Swap, refresh reserves for that pool
- *  - Reuse your direct arb math; append to both direct_pool.json and event log
- *  - Attempt local triangular arbs around the updated pool and append tri hits
- *  --------------------------------------------------------------------- */
+// 4. /** -----------------------------------------------------------------------
+//  *  SWAP EVENT WATCH (Uniswap V2-style)
+//  *  (works via polling with JsonRpcProvider)
+//  *  --------------------------------------------------------------------- */
 
-// keccak256("Swap(address,uint256,uint256,uint256,uint256,address)")
 const SWAP_TOPIC = '0xd78ad95fa46c994b6551d0da85fc275fe613dacf8b9baed548f383ad7bc38c5f';
 
 // Stable key for pair regardless of token order
@@ -317,7 +258,6 @@ function appendJson(filename, record) {
   }
 }
 
-// Start watching Swap events for provided pools
 function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToken, edgeThreshold = 0) {
   if (!pairAddrsLower.length) {
     console.log('No pools to watch for swaps.');
@@ -331,7 +271,7 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
     topics: [SWAP_TOPIC]
   };
 
-  provider.on(filter, async (log) => {
+  const swapHandler = async (log) => {
     try {
       const addr = log.address.toLowerCase();
       const pool = poolsByAddr[addr];
@@ -356,14 +296,12 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
         if (edge > edgeThreshold) {
           const estProfitUSD = edgeToProfitUSD(edge);
           if (estProfitUSD >= MIN_PROFIT_USD) {
-            // Console signal
             console.log(
               `💡 Swap-led DIRECT ${pool.token0}↔${pool.token1} | ${pool.dex} vs ${other.dex} | ` +
               `edge=${(edge*100).toFixed(3)}% est=$${estProfitUSD.toFixed(2)} | ` +
               `A=${pool.pairAddr} B=${other.pairAddr} | tx=${log.transactionHash}`
             );
 
-            // Persist event record
             appendJson('swap_event_arbs.json', {
               type: 'direct',
               timestamp: Date.now(),
@@ -381,7 +319,6 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
               estProfitUSD
             });
 
-            // ALSO update direct_pool.json with this opportunity
             appendJson('direct_pool.json', {
               token0: pool.token0,
               token1: pool.token1,
@@ -400,7 +337,6 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
       }
 
       // ====== TRIANGULAR ARB (localized around updated pool) ======
-      // Try cycles of form A->B (updated pool), B->C, C->A
       const tokenA = pool.token0;
       const tokenB = pool.token1;
 
@@ -434,7 +370,6 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
                 `pools=[${pool.pairAddr}, ${pool2.pairAddr}, ${pool3.pairAddr}] | tx=${log.transactionHash}`
               );
 
-              // Persist event record
               appendJson('swap_event_arbs.json', {
                 type: 'triangular',
                 timestamp: Date.now(),
@@ -448,7 +383,6 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
                 estProfitUSD
               });
 
-              // ALSO update tri_pool.json with this triangle opportunity
               appendJson('tri_pool.json', {
                 route: [tokenA, tokenB, tokenC, tokenA],
                 pools: [pool.pairAddr, pool2.pairAddr, pool3.pairAddr],
@@ -465,12 +399,15 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
     } catch (e) {
       console.error('Swap handler error:', e?.message || e);
     }
-  });
+  };
+
+  // Register through the wrapper so it auto re-subscribes after failover
+  addLogListener(filter, swapHandler);
 }
 
-// === MAIN LOGIC ===
+// 7 // === MAIN LOGIC ===
 (async () => {
-  await ready(); // ensure WebSocket is open before any contract calls
+  await ready(); // ensure RPC is responsive before contract calls
 
   const allPools = [];
 
@@ -490,7 +427,16 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
     }
 
     console.log(`Fetching pairs for ${dexName}...`);
-    const pairs = await fetchPairs(factoryAddr, abi);
+    let pairs = [];
+    try {
+      pairs = await fetchPairs(factoryAddr, abi);
+    } catch (e) {
+      console.error(`RPC error on ${dexName} fetchPairs:`, e?.message || e);
+      // Try next RPC automatically on next call site
+      await failover();
+      await ready();
+      pairs = await fetchPairs(factoryAddr, abi);
+    }
     console.log(`${dexName}: Found ${pairs.length} pairs`);
 
     for (const pairAddr of pairs) {
@@ -517,9 +463,9 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
     return liquidityUSD >= MIN_LIQUIDITY_USD;
   });
 
-  /** --------------------------------------------------------------
-   *  Build indexes for SAME-PAIR matching and start Swap listeners
-   *  ------------------------------------------------------------*/
+  // 8  /** --------------------------------------------------------------
+  //    *  Build indexes for SAME-PAIR matching and start Swap listeners
+  //    *  ------------------------------------------------------------*/
   const poolsByPairKey = {};
   const poolsByAddr = {};
   const poolsByToken = {};
@@ -538,7 +484,7 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
     ARB_THRESHOLD
   );
 
-  // Calculate direct arbitrage
+  // 9  // Calculate direct arbitrage
   const directArbs = [];
   for (let i = 0; i < filteredPools.length; i++) {
     for (let j = i + 1; j < filteredPools.length; j++) {
@@ -574,7 +520,7 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
     }
   }
 
-  // Calculate triangular arbitrage
+  // 10  // Calculate triangular arbitrage
   const triArbs = [];
   const poolsByTokenScan = {};
 
@@ -623,7 +569,7 @@ function startSwapWatch(pairAddrsLower, poolsByAddr, poolsByPairKey, poolsByToke
     }
   }
 
-  // Sort results by profit
+  // 11 // Sort results by profit
   directArbs.sort((a, b) => (b.estProfitUSD - a.estProfitUSD));
   triArbs.sort((a, b) => (b.estProfitUSD - a.estProfitUSD));
 
